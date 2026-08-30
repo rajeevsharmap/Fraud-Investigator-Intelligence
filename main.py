@@ -20,11 +20,18 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException
 
+from agents.grok_client import GrokClient
+from agents.hypothesis_agents import run_all as run_agents
+from audit.auditor import audit as run_auditor
+from audit.next_best_action import next_best_action
+from audit.trail import read as read_trail, record as record_event
 from detection.loader import BankData
 from detection.network_layer import build_case_network
 from detection.pipeline import run_pipeline
 from evidence.builder import EvidenceBuilder
 from evidence.sanitizer import PIISanitizer
+from regulatory.rag import retrieve as rag_retrieve
+from regulatory.rules_engine import evaluate as regulatory_evaluate
 
 MOCKDATA_DIR = os.environ.get("MOCKDATA_DIR", "./mockdata")
 VALID_ROLES = ("JUNIOR", "SENIOR")
@@ -109,9 +116,6 @@ def case_network(case_id: str, x_investigator_role: str | None = Header(default=
 
 # ---------------- Checkpoint 3: evidence builder + PII sanitizer ----------------
 
-HYPOTHESIS_AGENTS = ["scammer_hypothesis", "legitimate_hypothesis", "contradiction"]
-
-
 def _case_with_alerts(case_id: str, role: str):
     case = _get_case(case_id, role)
     alert_ids = set(case["alert_ids"].split(",")) if case["alert_ids"] else set()
@@ -119,11 +123,25 @@ def _case_with_alerts(case_id: str, role: str):
     return case, alerts
 
 
+def _evidence_path(case_id: str, suffix: str) -> str:
+    return os.path.join(MOCKDATA_DIR, "evidence", f"{case_id}{suffix}.json")
+
+
+def _save_json(obj: dict, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1, default=str)
+
+
+def _load_json(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 @app.post("/cases/{case_id}/investigate")
 def start_investigation(case_id: str, x_investigator_role: str | None = Header(default=None)):
-    """Start Investigation: bundle all case evidence (Checkpoint 3), mask PII
-    (consistent aliases, e.g. ACC-DFJNW23 -> ACC-0001) and produce the
-    LLM-safe package handed to the hypothesis agents."""
+    """Start Investigation (Checkpoints 3+4): bundle case evidence, mask PII,
+    then run the three hypothesis agents on the LLM-safe package."""
     role = _require_role(x_investigator_role)
     case, alerts = _case_with_alerts(case_id, role)
     builder = EvidenceBuilder(app.state.data,
@@ -131,7 +149,12 @@ def start_investigation(case_id: str, x_investigator_role: str | None = Header(d
     raw = builder.build(case, alerts)
     safe = PIISanitizer().mask_package(raw, role)
     builder.save(safe)
-    return {"llm_safe_evidence": safe, "agents_pending": HYPOTHESIS_AGENTS}
+    agents_out = run_agents(safe, GrokClient())
+    _save_json(agents_out, _evidence_path(case_id, "_agents"))
+    record_event(MOCKDATA_DIR, case_id, role,
+                 "HYPOTHESIS_AGENTS_RUN",
+                 f"verdict={agents_out['contradiction'].get('verdict')}")
+    return {"llm_safe_evidence": safe, "agents": agents_out}
 
 
 @app.get("/cases/{case_id}/evidence")
@@ -145,3 +168,128 @@ def get_evidence(case_id: str, x_investigator_role: str | None = Header(default=
                             "POST /cases/{case_id}/investigate first")
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+# ------------- Checkpoints 5+6: regulatory, auditor, NBA, audit trail -------------
+
+def _full_analysis(case: dict, evidence: dict, agents_out: dict, role: str) -> dict:
+    """Regulatory engine -> RAG -> Investigation Auditor -> Next-Best-Action."""
+    regulatory = regulatory_evaluate(evidence, agents_out)
+    rag_context = (f"{case['primary_trigger']} {case['typologies']} "
+                   f"{regulatory['max_severity']} "
+                   + " ".join(f['detail'] for f in regulatory['findings']
+                              if f['applies'])
+                   + " " + str(agents_out.get('contradiction', {}).get('verdict')))
+    analysis = {
+        "case_id": case["case_id"],
+        "role": role,
+        "agents": agents_out,
+        "regulatory": regulatory,
+        "regulatory_rag": rag_retrieve(rag_context),
+        "auditor": run_auditor(case, evidence, agents_out, regulatory),
+    }
+    analysis["next_best_action"] = next_best_action(
+        agents_out, regulatory, analysis["auditor"])
+    return analysis
+
+
+@app.post("/cases/{case_id}/analysis")
+def run_analysis(case_id: str, x_investigator_role: str | None = Header(default=None)):
+    """Full Checkpoint 5+6 chain for the dashboard. Runs the three agents on
+    sanitized evidence, then the deterministic regulatory engine, India RAG,
+    investigation auditor, completeness score, routing and next-best-action.
+    Writes mockdata/audit_trail.csv events."""
+    role = _require_role(x_investigator_role)
+    case, _ = _case_with_alerts(case_id, role)
+    ev_path = os.path.join(MOCKDATA_DIR, "evidence", f"{case_id}.json")
+    if not os.path.exists(ev_path):
+        raise HTTPException(status_code=404, detail="no evidence package yet - "
+                            "POST /cases/{case_id}/investigate first")
+    evidence = _load_json(ev_path)
+    agents_out = _load_json(_evidence_path(case_id, "_agents")) \
+        if os.path.exists(_evidence_path(case_id, "_agents")) else None
+    if agents_out is None:
+        agents_out = run_agents(evidence, GrokClient())
+        _save_json(agents_out, _evidence_path(case_id, "_agents"))
+
+    analysis = _full_analysis(case, evidence, agents_out, role)
+    _save_json(analysis, _evidence_path(case_id, "_analysis"))
+    record_event(MOCKDATA_DIR, case_id, role, "ANALYSIS_RUN",
+                 f"routing={analysis['auditor']['routing']} "
+                 f"score={analysis['auditor']['score']} "
+                 f"nba={analysis['next_best_action']['action']}")
+    return analysis
+
+
+@app.get("/cases/{case_id}/analysis")
+def get_analysis(case_id: str, x_investigator_role: str | None = Header(default=None)):
+    """Stored dashboard payload for a case."""
+    role = _require_role(x_investigator_role)
+    _get_case(case_id, role)
+    path = _evidence_path(case_id, "_analysis")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="no analysis yet - "
+                            "POST /cases/{case_id}/analysis first")
+    return _load_json(path)
+
+
+@app.get("/cases/{case_id}/audit-trail")
+def audit_trail(case_id: str, x_investigator_role: str | None = Header(default=None)):
+    role = _require_role(x_investigator_role)
+    _get_case(case_id, role)
+    return {"case_id": case_id, "events": read_trail(MOCKDATA_DIR, case_id)}
+
+
+ESCALATION_SCHEMA = ["escalation_id", "case_id", "escalation_reason",
+                     "completeness_score_at_escalation", "primary_trigger",
+                     "evidence_signals", "escalated_at", "escalated_by",
+                     "status"]
+
+
+@app.post("/cases/{case_id}/escalate")
+def escalate_case(case_id: str, body: dict,
+                  x_investigator_role: str | None = Header(default=None)):
+    """Human-review action (Checkpoints 6+30): Junior escalates to Senior.
+    Appends a row to case_escalation.csv (starts empty, populated only on a
+    real escalation event) and moves the case into the Senior queue."""
+    role = _require_role(x_investigator_role)
+    if role != "JUNIOR":
+        raise HTTPException(status_code=403, detail="only JUNIOR escalates")
+    case = _get_case(case_id, role)
+    reason = body.get("reason") or "escalated by investigator"
+    path = os.path.join(MOCKDATA_DIR, "case_escalation.csv")
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=ESCALATION_SCHEMA).writeheader()
+    analysis_path = _evidence_path(case_id, "_analysis")
+    score = _load_json(analysis_path)["auditor"]["score"] \
+        if os.path.exists(analysis_path) else ""
+    import random, string
+    eid = "ESC-" + "".join(random.Random().choice(string.ascii_uppercase + string.digits)
+                           for _ in range(7))
+    from datetime import datetime
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=ESCALATION_SCHEMA).writerow({
+            "escalation_id": eid, "case_id": case_id,
+            "escalation_reason": reason,
+            "completeness_score_at_escalation": score,
+            "primary_trigger": case["primary_trigger"],
+            "evidence_signals": case["evidence_signals"],
+            "escalated_at": datetime.now().replace(microsecond=0)
+            .strftime("%Y-%m-%d %H:%M:%S"),
+            "escalated_by": "JUNIOR", "status": "OPEN"})
+    _update_case_status(case_id, "SENIOR")
+    record_event(MOCKDATA_DIR, case_id, "JUNIOR", "ESCALATED_TO_SENIOR", reason)
+    return {"escalation_id": eid, "case_id": case_id, "status": "SENIOR"}
+
+
+def _update_case_status(case_id: str, new_status: str):
+    path = os.path.join(MOCKDATA_DIR, "cases.csv")
+    rows = _read_csv("cases.csv")
+    for r in rows:
+        if r["case_id"] == case_id:
+            r["status"] = new_status
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
