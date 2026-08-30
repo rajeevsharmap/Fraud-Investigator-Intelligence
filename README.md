@@ -9,7 +9,7 @@ banking context. See `Architecture.md` for the full system design.
 | ---------- | ----- | ------ |
 | 1 | Mock Data Generator | **Complete** (`generate_mockdata.py`, data in `mockdata/`) |
 | 2 | Rule-Based Detection & Network Layer | **Complete** (`detection/`, `main.py`) |
-| 3 | PII Sanitizer & Evidence Builder | Not started |
+| 3 | PII Sanitizer & Evidence Builder | **Complete** (`evidence/`) |
 | 4 | Three Grok-based LLM Agents | Not started |
 | 5 | Regulatory Compliance & Investigation Auditor | Not started |
 | 6 | Next-Best-Action, Audit Trail, Human Review | Not started |
@@ -117,3 +117,25 @@ python -m pytest tests/ -q
   core/distribution-side signal), security+transaction context for
   account_swap; no `money_mule` typology exists anywhere.
 - Every new case is assigned `status=JUNIOR`; escalation comes later.
+
+## Checkpoint 3 — Evidence Builder + PII Sanitizer
+
+`evidence/builder.py` groups all evidence for one case (CASE_ID): case
+metadata, account profile, bundled alerts with rule evidence, in/out
+transactions in the alert window, devices, geo events, used beneficiaries,
+network output (≤3 hops) and the security timeline.
+
+`evidence/sanitizer.py` is the hard PII boundary before anything reaches an
+LLM:
+
+- consistent per-case aliases: `ACC-DFJNW23 -> ACC-0001`, `TXN-... -> TXN-0001`, ...
+- direct identifiers never enter the package (customer/beneficiary names,
+  account numbers, IFSC, occupation, income, IPs, coordinates, fingerprints)
+- role-aware: JUNIOR additionally loses restricted KYC/beneficiary detail
+
+Flow: authenticated investigator presses **Start Investigation** ->
+`POST /cases/{case_id}/investigate` -> bundles, sanitizes, persists the
+package to `mockdata/evidence/{case_id}.json` and returns it together with
+the pending handoff (`scammer_hypothesis`, `legitimate_hypothesis`,
+`contradiction` - consumed in Checkpoint 4). Stored packages are fetchable
+via `GET /cases/{case_id}/evidence`.

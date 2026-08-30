@@ -8,3 +8,6 @@ __pycache__/
 
 # local scratch output (the committed dataset lives in mockdata/)
 mockdata_seed*/
+
+# generated evidence packages (rebuilt via POST /cases/{id}/investigate)
+mockdata/evidence/

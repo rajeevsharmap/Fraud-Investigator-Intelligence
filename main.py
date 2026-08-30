@@ -14,6 +14,7 @@ with real authentication/authorization without changing this boundary.
 from __future__ import annotations
 
 import csv
+import json
 import os
 from contextlib import asynccontextmanager
 
@@ -22,6 +23,8 @@ from fastapi import FastAPI, Header, HTTPException
 from detection.loader import BankData
 from detection.network_layer import build_case_network
 from detection.pipeline import run_pipeline
+from evidence.builder import EvidenceBuilder
+from evidence.sanitizer import PIISanitizer
 
 MOCKDATA_DIR = os.environ.get("MOCKDATA_DIR", "./mockdata")
 VALID_ROLES = ("JUNIOR", "SENIOR")
@@ -102,3 +105,43 @@ def case_network(case_id: str, x_investigator_role: str | None = Header(default=
     role = _require_role(x_investigator_role)
     case = _get_case(case_id, role)
     return build_case_network(app.state.data, case["account_id"])
+
+
+# ---------------- Checkpoint 3: evidence builder + PII sanitizer ----------------
+
+HYPOTHESIS_AGENTS = ["scammer_hypothesis", "legitimate_hypothesis", "contradiction"]
+
+
+def _case_with_alerts(case_id: str, role: str):
+    case = _get_case(case_id, role)
+    alert_ids = set(case["alert_ids"].split(",")) if case["alert_ids"] else set()
+    alerts = [a for a in _read_csv("suspected_alerts.csv") if a["alert_id"] in alert_ids]
+    return case, alerts
+
+
+@app.post("/cases/{case_id}/investigate")
+def start_investigation(case_id: str, x_investigator_role: str | None = Header(default=None)):
+    """Start Investigation: bundle all case evidence (Checkpoint 3), mask PII
+    (consistent aliases, e.g. ACC-DFJNW23 -> ACC-0001) and produce the
+    LLM-safe package handed to the hypothesis agents."""
+    role = _require_role(x_investigator_role)
+    case, alerts = _case_with_alerts(case_id, role)
+    builder = EvidenceBuilder(app.state.data,
+                              os.path.join(MOCKDATA_DIR, "evidence"))
+    raw = builder.build(case, alerts)
+    safe = PIISanitizer().mask_package(raw, role)
+    builder.save(safe)
+    return {"llm_safe_evidence": safe, "agents_pending": HYPOTHESIS_AGENTS}
+
+
+@app.get("/cases/{case_id}/evidence")
+def get_evidence(case_id: str, x_investigator_role: str | None = Header(default=None)):
+    """Fetch the stored (already sanitized) evidence package for a case."""
+    role = _require_role(x_investigator_role)
+    _get_case(case_id, role)     # authorization check
+    path = os.path.join(MOCKDATA_DIR, "evidence", f"{case_id}.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="no evidence package yet - "
+                            "POST /cases/{case_id}/investigate first")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
