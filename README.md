@@ -251,3 +251,18 @@ Note: the LLM layer is strictly online (no offline fallback). The provider
 endpoint/model/key are env-configurable via `.env` (`GROK_API_KEY`,
 `GROK_API_URL`, `GROK_MODEL`), so any OpenAI-compatible endpoint (x.ai
 Grok, Groq, ...) can be used without touching the pipeline.
+
+### Checkpoint 7 - remaining work (case memory)
+
+- `reference_cases.csv` (case memory) is **not implemented yet**. It must be
+  created empty and populated only when an investigator explicitly chooses to
+  retain a completed case (never automatically): case identity, typology,
+  evidence summary, network findings, investigation reasoning, final action,
+  outcome and investigator-provided reference notes.
+- Endpoints: `POST /cases/{case_id}/reference` (store as reference, JUNIOR or
+  SENIOR per authorization matrix) and `GET /reference-cases` (query case
+  memory). Must respect authentication/authorization.
+- Case memory is a reference artifact only - it must not silently become a
+  detection rule or alter model behaviour (Architecture.md s36-37).
+- The full chain (evidence -> agents -> auditor -> NBA -> SAR PDF on disk) is
+  implemented but has not yet been executed end-to-end with the live LLM.
