@@ -293,3 +293,32 @@ def _update_case_status(case_id: str, new_status: str):
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
+
+
+# ---------------- Checkpoint 7: SAR report + audit-ready case ----------------
+
+from reports.sar import generate as generate_sar   # noqa: E402
+
+
+@app.post("/cases/{case_id}/sar-report")
+def sar_report(case_id: str, x_investigator_role: str | None = Header(default=None)):
+    """SAR Report button (JUNIOR or SENIOR). Summarizes the full investigation
+    dossier - evidence, the three Grok agent responses, regulatory findings,
+    RAG references, auditor result, next-best-action and audit trail - into a
+    password-protected PDF, then moves the case to audit_ready_cases.csv."""
+    role = _require_role(x_investigator_role)
+    case = _get_case(case_id, role)
+
+    ev_path = _evidence_path(case_id, "")
+    an_path = _evidence_path(case_id, "_analysis")
+    if not os.path.exists(ev_path) or not os.path.exists(an_path):
+        raise HTTPException(status_code=404, detail="no analysis yet - run POST "
+                            "/cases/{case_id}/investigate then POST "
+                            "/cases/{case_id}/analysis first")
+    trail = read_trail(MOCKDATA_DIR, case_id)
+    result = generate_sar(case, _load_json(ev_path), _load_json(an_path), trail,
+                          MOCKDATA_DIR)
+    record_event(MOCKDATA_DIR, case_id, role, "SAR_GENERATED", result["report_path"])
+    return {"case_id": case_id, "status": "SAR_READY", "generated_by": role,
+            "report_path": result["report_path"], "password": result["password"],
+            "alert": result["alert"], "narrative": result["narrative"]}

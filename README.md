@@ -13,7 +13,7 @@ banking context. See `Architecture.md` for the full system design.
 | 4 | Three Grok-based LLM Agents | **Complete (MVP)** (`agents/`; Grok via API key, deterministic offline fallback) |
 | 5 | Regulatory Compliance & Investigation Auditor | **Complete (MVP)** (`regulatory/`, `audit/auditor.py`) |
 | 6 | Next-Best-Action, Audit Trail, Human Review | **Complete (MVP)** (`audit/next_best_action.py`, `audit/trail.py`, escalation endpoint) |
-| 7 | SAR Report & Case Memory | Not started |
+| 7 | SAR Report & Case Memory | **Complete** (`reports/sar.py`, `POST /cases/{id}/sar-report`) |
 
 ## Checkpoint 1 — Mock Data Generator
 
@@ -222,3 +222,32 @@ Tests for the new layers live in `tests/test_regulatory_audit.py`
 (regulatory determinism, RAG citations, auditor scoring, NBA ladder,
 audit trail, and a regression test that an LLM verdict cannot suppress an
 STR finding).
+
+## Checkpoint 7 - SAR Report (final step)
+
+`reports/sar.py` finalizes an investigation:
+
+1. **LLM-based SAR narrative** - Grok summarizes the complete dossier
+   (sanitized evidence, the three hypothesis-agent responses, regulatory
+   findings, RAG references, auditor result, next-best-action, audit trail)
+   into executive summary, suspicious-activity narrative, subject analysis
+   and assessment conclusion. Facts only - the prompt forbids inventing
+   evidence.
+2. **Password-protected PDF** (`mockdata/reports/SAR_{case_id}.pdf`,
+   reportlab + pypdf). The password is the account holder's account id last
+   four digits; the API response returns an explicit alert stating this
+   format (and the value for the generated report).
+3. **Audit-ready lifecycle** - the finalized case moves into
+   `audit_ready_cases.csv` (with completeness score, NBA action and report
+   path) and its status becomes `SAR_READY` in `cases.csv`. A
+   `SAR_GENERATED` event is appended to the audit trail.
+
+Frontend flow (backend implemented): Junior or Senior presses the
+**SAR Report** button -> `POST /cases/{case_id}/sar-report` (requires the
+case to have evidence + analysis) -> returns report path, password and the
+alert message.
+
+Note: the LLM layer is strictly online (no offline fallback). The provider
+endpoint/model/key are env-configurable via `.env` (`GROK_API_KEY`,
+`GROK_API_URL`, `GROK_MODEL`), so any OpenAI-compatible endpoint (x.ai
+Grok, Groq, ...) can be used without touching the pipeline.

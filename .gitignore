@@ -11,3 +11,6 @@ mockdata_seed*/
 
 # generated evidence packages (rebuilt via POST /cases/{id}/investigate)
 mockdata/evidence/
+# generated SAR PDFs + runtime audit trail
+mockdata/reports/
+mockdata/audit_trail.csv
