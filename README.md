@@ -10,9 +10,9 @@ banking context. See `Architecture.md` for the full system design.
 | 1 | Mock Data Generator | **Complete** (`generate_mockdata.py`, data in `mockdata/`) |
 | 2 | Rule-Based Detection & Network Layer | **Complete** (`detection/`, `main.py`) |
 | 3 | PII Sanitizer & Evidence Builder | **Complete** (`evidence/`) |
-| 4 | Three Grok-based LLM Agents | Not started |
-| 5 | Regulatory Compliance & Investigation Auditor | Not started |
-| 6 | Next-Best-Action, Audit Trail, Human Review | Not started |
+| 4 | Three Grok-based LLM Agents | **Complete (MVP)** (`agents/`; Grok via API key, deterministic offline fallback) |
+| 5 | Regulatory Compliance & Investigation Auditor | **Complete (MVP)** (`regulatory/`, `audit/auditor.py`) |
+| 6 | Next-Best-Action, Audit Trail, Human Review | **Complete (MVP)** (`audit/next_best_action.py`, `audit/trail.py`, escalation endpoint) |
 | 7 | SAR Report & Case Memory | Not started |
 
 ## Checkpoint 1 — Mock Data Generator
@@ -139,3 +139,86 @@ package to `mockdata/evidence/{case_id}.json` and returns it together with
 the pending handoff (`scammer_hypothesis`, `legitimate_hypothesis`,
 `contradiction` - consumed in Checkpoint 4). Stored packages are fetchable
 via `GET /cases/{case_id}/evidence`.
+
+## Checkpoint 4 — Three Grok-Based LLM Agents (MVP)
+
+`agents/grok_client.py` is the isolated provider boundary (Architecture.md
+§24): the key comes from `GROK_API_KEY` in `.env` and the rest of the
+pipeline never touches the API. `agents/hypothesis_agents.py` implements the
+Scammer, Legitimate and Contradiction agents; each receives ONLY the
+PII-sanitized evidence package and returns structured JSON.
+
+- With `GROK_API_KEY` set, Grok produces the analysis (JSON-validated,
+  temperature 0.2).
+- Without a key (or on API/JSON failure) a **deterministic fallback** runs:
+  it only recombines fields already in the package (alert scores, network
+  stats, security signals, baselines) and never invents evidence. This keeps
+  the full architecture testable offline — accuracy improves by swapping in
+  the real model, not by changing the pipeline.
+
+`POST /cases/{case_id}/investigate` now returns the sanitized package plus
+the three agent replies (persisted to `mockdata/evidence/{case_id}_agents.json`).
+
+## Checkpoint 5 — Regulatory Compliance & Investigation Auditor (MVP)
+
+`regulatory/rules_engine.py` — **deterministic, India-specific** rule engine.
+LLM output is analysis input only and can never override it:
+
+| Rule | Trigger | Citation |
+| ---- | ------- | -------- |
+| REG-PMLA-001 | STR warranted (alert score >= 45 or strong scammer verdict) | PMLA 2002 s.13; PMLA Records Rules 2015 r.3 |
+| REG-CTR-002 | aggregate cash >= Rs 10 lakh in window | PMLA Records Rules 2015 r.3 (CTR) |
+| REG-FEMA-003 | international transactions | FEMA 1999; RBI LRS Master Direction |
+| REG-RBI-004 | single UPI txn > Rs 1 lakh | NPCI UPI guidelines |
+| REG-KYC-005 | KYC missing/pending/failed | RBI KYC Master Direction 2016 |
+| REG-RBI-006 | outbound/inbound >= 0.80 (layering) | RBI mule-account advisories |
+| REG-ACCT-007 | account < 90 days old, outflow >= 3x baseline | RBI new-account monitoring |
+
+`regulatory/rag.py` — India-only RAG over a curated corpus (PMLA, RBI KYC
+Master Direction, FEMA/LRS, NPCI UPI, RBI mule/takeover advisories). Pure
+stdlib keyword retrieval; output is supporting context with citations, never
+an authorization mechanism.
+
+`audit/auditor.py` — rule-based Investigation Auditor: weighted evidence
+checklist -> completeness score 0–100 (investigation completeness, NOT fraud
+probability) -> routing (COMPLETE / MORE_EVIDENCE_REQUIRED /
+ESCALATION_REQUIRED) plus a Junior->Senior escalation flag when restricted
+information is needed.
+
+## Checkpoint 6 — Next-Best-Action, Audit Trail, Human Review (MVP)
+
+- `audit/next_best_action.py` — deterministic ladder: ESCALATE (auditor
+  routing/escalation flag) > BLOCK (scammer verdict + STR warranted +
+  complete investigation) > CLEAR (legitimate + no critical finding) >
+  MONITOR (default residual suspicion). The LLM recommends; rules decide.
+- `audit/trail.py` — append-only `mockdata/audit_trail.csv` (EVT-* events for
+  agent runs, analyses, escalations); readable per case via
+  `GET /cases/{case_id}/audit-trail`.
+- `POST /cases/{case_id}/escalate` — Junior-only human action; appends a row
+  to `mockdata/case_escalation.csv` (starts empty, populated only on a real
+  escalation event per Architecture.md §29) and moves the case to the Senior
+  queue. Original case history is preserved.
+
+### Dashboard-facing API (Checkpoints 5+6)
+
+```
+POST /cases/{case_id}/investigate   evidence + three agent replies
+POST /cases/{case_id}/analysis      full chain: agents -> regulatory -> RAG
+                                    -> auditor -> NBA (dashboard payload)
+GET  /cases/{case_id}/analysis      fetch stored analysis
+GET  /cases/{case_id}/audit-trail   case audit history
+POST /cases/{case_id}/escalate      Junior -> Senior escalation
+```
+
+All endpoints enforce `X-Investigator-Role` server-side. Run one case
+end-to-end:
+
+```
+curl -X POST -H "X-Investigator-Role: JUNIOR" http://127.0.0.1:8000/cases/<case_id>/investigate
+curl -X POST -H "X-Investigator-Role: JUNIOR" http://127.0.0.1:8000/cases/<case_id>/analysis
+```
+
+Tests for the new layers live in `tests/test_regulatory_audit.py`
+(regulatory determinism, RAG citations, auditor scoring, NBA ladder,
+audit trail, and a regression test that an LLM verdict cannot suppress an
+STR finding).
