@@ -1,5 +1,14 @@
 # Checkpoint 1 - Mock Data Generator
 faker>=20.0.0
 
-# Later checkpoints (detection layer, API, reports) will add:
-# fastapi, uvicorn[standard], python-dotenv, networkx, matplotlib, pytest
+# Checkpoint 2 - Detection Layer, Network Layer, API
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+networkx>=3.0
+
+# Tests
+pytest>=8.0.0
+httpx>=0.27.0
+
+# Later checkpoints will add:
+# python-dotenv (Grok key config, Checkpoint 4), matplotlib

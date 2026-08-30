@@ -8,7 +8,7 @@ banking context. See `Architecture.md` for the full system design.
 | Checkpoint | Scope | Status |
 | ---------- | ----- | ------ |
 | 1 | Mock Data Generator | **Complete** (`generate_mockdata.py`, data in `mockdata/`) |
-| 2 | Rule-Based Detection & Network Layer | Not started |
+| 2 | Rule-Based Detection & Network Layer | **Complete** (`detection/`, `main.py`) |
 | 3 | PII Sanitizer & Evidence Builder | Not started |
 | 4 | Three Grok-based LLM Agents | Not started |
 | 5 | Regulatory Compliance & Investigation Auditor | Not started |
@@ -66,3 +66,54 @@ non-zero on failure.
 accounts/transactions to the expected typology, detection outcome, and network
 involvement. It is used exclusively to evaluate Checkpoint 2 detection results.
 No operational component may read it (Architecture.md §11).
+
+## Checkpoint 2 — Rule-Based Detection & Network Layer
+
+### Layout
+
+```
+detection/
+  rulebook.py       the 24 rules from Architecture.md §16, verbatim scores
+  loader.py         CSV loader with per-account time-indexed transfer lists
+  detector.py       Detection Agent: evaluates every account, deterministic
+  case_intake.py    bundles one account's alerts into a single case (status JUNIOR)
+  pipeline.py       entry point: run detection -> write cases.csv / suspected_alerts.csv
+  network_layer.py  on-demand NetworkX graph (<= 3 hops) + Cytoscape.js JSON
+main.py             FastAPI service boundary
+tests/              pytest suite (detection, network, API)
+```
+
+### Execution model (MVP requirement)
+
+- The Detection pipeline runs **at application startup** (and via
+  `POST /detection/run`) — never when an investigator opens the dashboard.
+- `GET /cases` **reads the already-generated cases** and returns only cases
+  authorized for the caller's role (`X-Investigator-Role: JUNIOR|SENIOR`;
+  Junior sees the Junior queue).
+- The Network Layer is **on demand per case**: `GET /cases/{case_id}/network`
+  builds the ≤3-hop fund-flow graph plus the security timeline for that case
+  and returns Cytoscape.js elements.
+
+### Run
+
+```
+python -m detection.pipeline            # standalone pipeline run
+uvicorn main:app --reload               # API (runs detection at startup)
+
+# try it:
+curl -H "X-Investigator-Role: JUNIOR" http://127.0.0.1:8000/cases
+curl -H "X-Investigator-Role: JUNIOR" http://127.0.0.1:8000/cases/<case_id>/network
+python -m pytest tests/ -q
+```
+
+### Results on the committed dataset (seed 42)
+
+- 14 cases from 345 accounts; **12/12 ground-truth expected alert accounts
+  detected** (smurfing chains, reverse-smurfing sources, all 4 account-swap
+  victims) with 2 borderline false positives (payroll-like distribution and a
+  profile-deviation + chain combination) — realistic noise for the LLM layer
+  to assess in Checkpoint 4.
+- Detection gating per §17: ≥2 qualifying rules per network typology (plus a
+  core/distribution-side signal), security+transaction context for
+  account_swap; no `money_mule` typology exists anywhere.
+- Every new case is assigned `status=JUNIOR`; escalation comes later.
