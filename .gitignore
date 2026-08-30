@@ -1,0 +1,10 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local scratch output (the committed dataset lives in mockdata/)
+mockdata_seed*/
