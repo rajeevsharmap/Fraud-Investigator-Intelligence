@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tekmerion Intelligence - Investigations</title>
+<style>
+  body { font-family: sans-serif; margin: 2rem; background: #f5f6f8; }
+  select, button { padding: .4rem .8rem; font-size: 1rem; }
+  button { cursor: pointer; }
+  .agent { background: #fff; border: 1px solid #ddd; border-radius: 8px;
+           padding: 1rem; margin: 1rem 0; white-space: pre-wrap; }
+  h3 { margin-top: 0; }
+  #status { color: #555; }
+</style>
+</head>
+<body>
+<h1>Tekmerion Intelligence</h1>
+<p>
+  Role:
+  <select id="role"><option>JUNIOR</option><option>SENIOR</option></select>
+  Case: <select id="case"><option>loading...</option></select>
+  <button onclick="investigate()">Start Investigation</button>
+</p>
+<p id="status"></p>
+<div id="results"></div>
+<script>
+async function loadCases() {
+  const r = await fetch('/cases', { headers: { 'X-Investigator-Role': role() } });
+  const data = await r.json();
+  const sel = document.getElementById('case');
+  sel.innerHTML = '';
+  (data.cases || []).forEach(c => {
+    const o = document.createElement('option');
+    o.value = c.case_id;
+    o.textContent = `${c.case_id} (${c.primary_trigger})`;
+    sel.appendChild(o);
+  });
+}
+const role = () => document.getElementById('role').value;
+
+async function investigate() {
+  const caseId = document.getElementById('case').value;
+  const status = document.getElementById('status');
+  const results = document.getElementById('results');
+  if (!caseId) { status.textContent = 'Select a case first.'; return; }
+  status.textContent = `Investigating ${caseId}: scammer + legitimate agents running in parallel...`;
+  results.innerHTML = '';
+  try {
+    const r = await fetch(`/cases/${caseId}/investigate`,
+      { method: 'POST', headers: { 'X-Investigator-Role': role() } });
+    if (!r.ok) { status.textContent = 'Error: ' + (await r.json()).detail; return; }
+    const res = await r.json();
+    status.textContent =
+      `Done in ~${res.timing_seconds.parallel_hypotheses}s parallel + ${res.timing_seconds.contradiction}s contradiction. Verdict: ${res.agents.contradiction.verdict}`;
+    const titles = { scammer_hypothesis: 'Scammer Hypothesis Agent',
+                     legitimate_hypothesis: 'Legitimate Hypothesis Agent',
+                     contradiction: 'Contradiction Agent' };
+    for (const [k, t] of Object.entries(titles)) {
+      const d = document.createElement('div');
+      d.className = 'agent';
+      d.innerHTML = `<h3>${t}</h3><pre>${JSON.stringify(res.agents[k], null, 2)}</pre>`;
+      results.appendChild(d);
+    }
+  } catch (e) { status.textContent = 'Request failed: ' + e; }
+}
+document.getElementById('role').onchange = loadCases;
+loadCases();
+</script>
+</body>
+</html>

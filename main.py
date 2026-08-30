@@ -1,4 +1,4 @@
-"""FastAPI service boundary for the Detection Layer (Checkpoint 2 MVP).
+"""FastAPI service boundary for Detection -> Evidence -> LLM Agents (MVP).
 
 Flow (per the MVP execution requirement):
   - The Detection pipeline runs at application startup (and on explicit
@@ -18,15 +18,21 @@ import json
 import os
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
 
+from agents.llm_client import GroqClient
+from agents.pipeline import run_investigation
 from detection.loader import BankData
 from detection.network_layer import build_case_network
 from detection.pipeline import run_pipeline
 from evidence.builder import EvidenceBuilder
-from evidence.sanitizer import PIISanitizer
+
+load_dotenv()  # GROQ_API_KEY / GROQ_MODEL come from .env (never hard-coded)
 
 MOCKDATA_DIR = os.environ.get("MOCKDATA_DIR", "./mockdata")
+INVESTIGATIONS_DIR = os.path.join(MOCKDATA_DIR, "investigations")
 VALID_ROLES = ("JUNIOR", "SENIOR")
 
 
@@ -107,10 +113,7 @@ def case_network(case_id: str, x_investigator_role: str | None = Header(default=
     return build_case_network(app.state.data, case["account_id"])
 
 
-# ---------------- Checkpoint 3: evidence builder + PII sanitizer ----------------
-
-HYPOTHESIS_AGENTS = ["scammer_hypothesis", "legitimate_hypothesis", "contradiction"]
-
+# ------- Checkpoint 4: Start Investigation -> three LLM hypothesis agents -------
 
 def _case_with_alerts(case_id: str, role: str):
     case = _get_case(case_id, role)
@@ -120,18 +123,40 @@ def _case_with_alerts(case_id: str, role: str):
 
 
 @app.post("/cases/{case_id}/investigate")
-def start_investigation(case_id: str, x_investigator_role: str | None = Header(default=None)):
-    """Start Investigation: bundle all case evidence (Checkpoint 3), mask PII
-    (consistent aliases, e.g. ACC-DFJNW23 -> ACC-0001) and produce the
-    LLM-safe package handed to the hypothesis agents."""
+async def start_investigation(case_id: str, x_investigator_role: str | None = Header(default=None)):
+    """Start Investigation (Checkpoint 4 MVP flow):
+
+    evidence built -> PII masked -> Scammer + Legitimate agents run IN
+    PARALLEL on the masked package -> when BOTH responses arrive they go to
+    the Contradiction Agent -> all three responses DEMASKED -> stored and
+    returned for frontend display.
+    """
     role = _require_role(x_investigator_role)
     case, alerts = _case_with_alerts(case_id, role)
     builder = EvidenceBuilder(app.state.data,
                               os.path.join(MOCKDATA_DIR, "evidence"))
-    raw = builder.build(case, alerts)
-    safe = PIISanitizer().mask_package(raw, role)
-    builder.save(safe)
-    return {"llm_safe_evidence": safe, "agents_pending": HYPOTHESIS_AGENTS}
+    return await run_investigation(case, alerts, role, builder,
+                                   client=GroqClient(),
+                                   out_dir=INVESTIGATIONS_DIR)
+
+
+@app.get("/cases/{case_id}/investigation")
+def get_investigation(case_id: str, x_investigator_role: str | None = Header(default=None)):
+    """Fetch the stored (demasked) agent result for frontend display."""
+    role = _require_role(x_investigator_role)
+    _get_case(case_id, role)  # authorization check
+    path = os.path.join(INVESTIGATIONS_DIR, f"{case_id}.json")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="no investigation result yet - "
+                            "POST /cases/{case_id}/investigate first")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@app.get("/")
+def index():
+    """Minimal MVP frontend: pick role, list cases, Start Investigation."""
+    return FileResponse(os.path.join("static", "index.html"))
 
 
 @app.get("/cases/{case_id}/evidence")
