@@ -10,7 +10,7 @@ banking context. See `Architecture.md` for the full system design.
 | 1 | Mock Data Generator | **Complete** (`generate_mockdata.py`, data in `mockdata/`) |
 | 2 | Rule-Based Detection & Network Layer | **Complete** (`detection/`, `main.py`) |
 | 3 | PII Sanitizer & Evidence Builder | **Complete** (`evidence/`) |
-| 4 | Three Grok-based LLM Agents | Not started |
+| 4 | Three Grok-based LLM Agents | **Complete** (`agents/`, Groq provider layer in `agents/llm_client.py`) |
 | 5 | Regulatory Compliance & Investigation Auditor | Not started |
 | 6 | Next-Best-Action, Audit Trail, Human Review | Not started |
 | 7 | SAR Report & Case Memory | Not started |
@@ -139,3 +139,64 @@ package to `mockdata/evidence/{case_id}.json` and returns it together with
 the pending handoff (`scammer_hypothesis`, `legitimate_hypothesis`,
 `contradiction` - consumed in Checkpoint 4). Stored packages are fetchable
 via `GET /cases/{case_id}/evidence`.
+
+## Checkpoint 4 — Three LLM Hypothesis Agents
+
+### Layout
+
+```
+agents/
+  llm_client.py   isolated provider layer (Groq, OpenAI-compatible) + robust JSON parsing
+  prompts.py      the three system prompts (JSON-only, never invent evidence)
+  hypothesis.py   scammer / legitimate / contradiction agents
+  pipeline.py     orchestration: mask -> parallel hypotheses -> contradiction -> demask
+static/index.html minimal MVP frontend (role, case list, Start Investigation, results)
+tests/test_agents.py masking boundary, parallelism, ordering, demasking, API (fake client)
+```
+
+### Execution model (MVP requirement)
+
+Pressing **Start Investigation** (`POST /cases/{case_id}/investigate`) runs:
+
+1. Evidence Builder assembles the case evidence (raw).
+2. PII Sanitizer **masks** it — one sanitizer instance per case, so its alias
+   map doubles as the demask key.
+3. **Scammer + Legitimate agents run in parallel** (`asyncio.gather`) on the
+   masked package only.
+4. When **both** responses have arrived they are passed, with the masked
+   evidence, to the **Contradiction Agent**, which returns a verdict
+   (`SCAMMER` / `LEGITIMATE` / `INCONCLUSIVE`).
+5. All three responses are **demasked** (aliases -> raw ids) and stored to
+   `mockdata/investigations/{case_id}.json` for frontend display.
+
+Agents see **only masked evidence**; raw ids never leave the PII boundary, and
+demasking happens exclusively after responses return.
+
+### Endpoints
+
+```
+POST /cases/{case_id}/investigate    run the full agent pipeline (returns the demasked result)
+GET  /cases/{case_id}/investigation  fetch the stored result (frontend display)
+GET  /                               minimal MVP frontend
+```
+
+### Configuration
+
+The provider is isolated behind `agents/llm_client.py`, so the model/provider
+can be swapped without touching the investigation pipeline. Credentials and
+model come from environment variables (`.env`, git-ignored):
+
+```
+GROQ_API_KEY=...                     # required
+GROQ_MODEL=llama-3.1-8b-instant      # optional, fastest working model first (MVP)
+```
+
+Tests use a fake LLM client — the suite never makes live API calls.
+
+### Run
+
+```
+uvicorn main:app --reload
+# open http://127.0.0.1:8000/ , pick a role + case, press Start Investigation
+python -m pytest tests/ -q
+```
