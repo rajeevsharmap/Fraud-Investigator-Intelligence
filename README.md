@@ -252,17 +252,29 @@ endpoint/model/key are env-configurable via `.env` (`GROK_API_KEY`,
 `GROK_API_URL`, `GROK_MODEL`), so any OpenAI-compatible endpoint (x.ai
 Grok, Groq, ...) can be used without touching the pipeline.
 
-### Checkpoint 7 - remaining work (case memory)
+### Checkpoint 7 - case memory (reference cases)
 
-- `reference_cases.csv` (case memory) is **not implemented yet**. It must be
-  created empty and populated only when an investigator explicitly chooses to
-  retain a completed case (never automatically): case identity, typology,
-  evidence summary, network findings, investigation reasoning, final action,
-  outcome and investigator-provided reference notes.
-- Endpoints: `POST /cases/{case_id}/reference` (store as reference, JUNIOR or
-  SENIOR per authorization matrix) and `GET /reference-cases` (query case
-  memory). Must respect authentication/authorization.
-- Case memory is a reference artifact only - it must not silently become a
-  detection rule or alter model behaviour (Architecture.md s36-37).
-- The full chain (evidence -> agents -> auditor -> NBA -> SAR PDF on disk) is
-  implemented but has not yet been executed end-to-end with the live LLM.
+`reports/case_memory.py` implements `reference_cases.csv`: populated ONLY
+when an investigator explicitly retains a completed case
+(`POST /cases/{case_id}/reference`, never automatic). Stores reference id,
+typology, evidence/network/reasoning summaries, final action, outcome and
+investigator notes. Finalized (SAR_READY) cases may be retained by any
+authenticated investigator; active cases keep queue visibility. Duplicates
+are rejected. Case memory is a reference artifact only - never a detection
+rule (Architecture.md s36-37). `GET /reference-cases` lists stored memory.
+
+### Checkpoint 7 - end-to-end test (one case: CASE-1YXQ2BP, smurfing)
+
+Ran live through the FastAPI API with the real LLM (no fallbacks):
+
+| Step | Endpoint | Result |
+| ---- | -------- | ------ |
+| Investigate | `POST /cases/{id}/investigate` | evidence grouped + PII masked (ACC-29GD8AF -> ACC-0001), 3 Grok agent responses stored |
+| Analysis | `POST /cases/{id}/analysis` | completeness 85, routing ESCALATION_REQUIRED, NBA ESCALATE, contradiction verdict: scammer |
+| SAR report | `POST /cases/{id}/sar-report` | LLM narrative + password-protected PDF (`mockdata/reports/SAR_CASE-1YXQ2BP.pdf`); verified encrypted - opens only with password `D8AF` (account id last four characters); alert message returned; case moved to `audit_ready_cases.csv`, status SAR_READY |
+| Case memory | `POST /cases/{id}/reference` | REF-0001 stored with investigator notes; duplicate rejected; visible via `GET /reference-cases` |
+
+Provider notes: Groq free tier limits requests to 8000 tokens/minute, so the
+SAR dossier is trimmed to fit; the client retries a 429 once after 30s
+(still a real LLM call). Pipeline reruns preserve case lifecycle statuses
+(SENIOR / SAR_READY). Full pytest suite: 27 passed.

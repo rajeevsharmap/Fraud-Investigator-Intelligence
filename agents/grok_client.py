@@ -54,8 +54,14 @@ class GrokClient:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 body = json.load(resp)
         except urllib.error.HTTPError as e:
-            raise RuntimeError(f"grok api http {e.code}: "
-                               f"{e.read()[:200].decode('utf-8', 'ignore')}") from e
+            detail = e.read()[:200].decode("utf-8", "ignore")
+            if e.code == 429:            # provider rate limit: wait, retry once
+                import time
+                time.sleep(30)
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                    body = json.load(resp)
+            else:
+                raise RuntimeError(f"grok api http {e.code}: {detail}") from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             raise RuntimeError(f"grok api unreachable: {e}") from e
         text = body["choices"][0]["message"]["content"].strip()

@@ -32,6 +32,16 @@ def run_pipeline(mockdata_dir: str = "./mockdata", run_at: datetime | None = Non
     alerts = agent.run()
     cases = CaseIntake(run_at).bundle(alerts)
 
+    # preserve case lifecycle statuses across pipeline reruns (MVP: detection
+    # regenerates the queue, but human lifecycle state must survive)
+    prev_path = os.path.join(mockdata_dir, "cases.csv")
+    if os.path.exists(prev_path):
+        with open(prev_path, encoding="utf-8", newline="") as f:
+            prev = {r["case_id"]: r.get("status", "") for r in csv.DictReader(f)}
+        for c in cases:
+            if prev.get(c["case_id"]) in ("SENIOR", "SAR_READY"):
+                c["status"] = prev[c["case_id"]]
+
     def write(path, schema, rows):
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=schema, extrasaction="ignore")

@@ -55,17 +55,17 @@ def _compact_dossier(evidence: dict, analysis: dict, trail: list[dict]) -> dict:
         "case": evidence.get("case"),
         "account": evidence.get("account"),
         "alerts": evidence.get("alerts"),
-        "transactions": (evidence.get("transactions") or [])[:40],
+        "transactions": (evidence.get("transactions") or [])[:12],
         "devices": evidence.get("devices"),
-        "geo_events": (evidence.get("geo_events") or [])[:25],
-        "beneficiaries": (evidence.get("beneficiaries") or [])[:15],
-        "network": {"stats": net.get("stats"), "edges": (net.get("edges") or [])[:20]},
+        "geo_events": (evidence.get("geo_events") or [])[:6],
+        "beneficiaries": (evidence.get("beneficiaries") or [])[:8],
+        "network": {"stats": net.get("stats"), "edges": (net.get("edges") or [])[:8]},
         "agents": analysis.get("agents"),
         "regulatory": analysis.get("regulatory"),
         "regulatory_rag": analysis.get("regulatory_rag"),
         "auditor": analysis.get("auditor"),
         "next_best_action": analysis.get("next_best_action"),
-        "audit_trail": trail,
+        "audit_trail": (trail or [])[-6:],
     }
 
 

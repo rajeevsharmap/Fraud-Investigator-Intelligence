@@ -45,15 +45,15 @@ def _evidence_digest(ev: dict) -> str:
         "alerts": [{k: a.get(k) for k in ("rule_id", "rule_name", "typology",
                                           "score", "evidence")}
                    for a in ev.get("alerts", [])],
-        "transactions": ev.get("transactions", [])[:40],
+        "transactions": ev.get("transactions", [])[:20],
         "devices": ev.get("devices", []),
-        "geo_events": ev.get("geo_events", [])[:25],
-        "beneficiaries": ev.get("beneficiaries", [])[:15],
+        "geo_events": ev.get("geo_events", [])[:10],
+        "beneficiaries": ev.get("beneficiaries", [])[:10],
         "network": {"stats": ev.get("network", {}).get("stats"),
-                    "edges": ev.get("network", {}).get("edges", [])[:20]},
-        "security_timeline": ev.get("security_timeline", [])[:25],
+                    "edges": ev.get("network", {}).get("edges", [])[:10]},
+        "security_timeline": ev.get("security_timeline", [])[:10],
     }
-    return json.dumps(slim, default=str)[:14000]
+    return json.dumps(slim, default=str)[:6000]
 
 
 class HypothesisAgents:

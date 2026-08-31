@@ -322,3 +322,41 @@ def sar_report(case_id: str, x_investigator_role: str | None = Header(default=No
     return {"case_id": case_id, "status": "SAR_READY", "generated_by": role,
             "report_path": result["report_path"], "password": result["password"],
             "alert": result["alert"], "narrative": result["narrative"]}
+
+
+# ---------------- Checkpoint 7 (cont.): case memory / reference cases ----------------
+
+from reports.case_memory import save as save_reference, read_all as read_references   # noqa: E402
+
+
+@app.post("/cases/{case_id}/reference")
+def add_reference(case_id: str, body: dict | None = None,
+                  x_investigator_role: str | None = Header(default=None)):
+    """Investigator explicitly retains a case as reference/case memory.
+    Never automatic (Architecture.md s36)."""
+    role = _require_role(x_investigator_role)
+    case = next((c for c in _read_csv("cases.csv") if c["case_id"] == case_id), None)
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"case {case_id} not found")
+    # finalized (SAR_READY) cases may be retained as reference by any
+    # authenticated investigator; active cases keep queue visibility rules
+    if case["status"] != "SAR_READY":
+        _get_case(case_id, role)
+    an_path = _evidence_path(case_id, "_analysis")
+    analysis = _load_json(an_path) if os.path.exists(an_path) else None
+    if analysis:
+        analysis["evidence_network"] = _load_json(
+            _evidence_path(case_id, "")).get("network", {}).get("stats")
+    result = save_reference(MOCKDATA_DIR, case, analysis,
+                            (body or {}).get("notes", ""), role)
+    if result.get("stored"):
+        record_event(MOCKDATA_DIR, case_id, role, "REFERENCE_SAVED",
+                     result["reference_id"])
+    return {"case_id": case_id, **result}
+
+
+@app.get("/reference-cases")
+def list_reference_cases(x_investigator_role: str | None = Header(default=None)):
+    role = _require_role(x_investigator_role)
+    refs = read_references(MOCKDATA_DIR)
+    return {"role": role, "count": len(refs), "reference_cases": refs}
