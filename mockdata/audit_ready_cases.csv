@@ -1,2 +1,5 @@
 case_id,account_id,created_at,primary_trigger,alert_ids,evidence_signals,typologies,status,bundle_reason,completeness_score,nba_action,sar_generated_at,report_path
 CASE-1YXQ2BP,ACC-29GD8AF,2026-08-31 21:44:52,smurfing,"ALR-6D8GDEG,ALR-FRNBKKP","SMF-005,SMF-006",smurfing,JUNIOR,,85,ESCALATE,2026-08-31 21:46:31,./mockdata\reports\SAR_CASE-1YXQ2BP.pdf
+CASE-1YXQ2BP,ACC-29GD8AF,2026-09-01 21:46:43,smurfing,"ALR-6D8GDEG,ALR-FRNBKKP","SMF-005,SMF-006",smurfing,SAR_READY,,85,ESCALATE,2026-09-01 21:46:58,./mockdata\reports\SAR_CASE-1YXQ2BP.pdf
+CASE-1YXQ2BP,ACC-29GD8AF,2026-09-01 21:46:43,smurfing,"ALR-6D8GDEG,ALR-FRNBKKP","SMF-005,SMF-006",smurfing,SAR_READY,,85,ESCALATE,2026-09-01 21:47:54,./mockdata\reports\SAR_CASE-1YXQ2BP.pdf
+CASE-1YXQ2BP,ACC-29GD8AF,2026-09-01 21:52:09,smurfing,"ALR-6D8GDEG,ALR-FRNBKKP","SMF-005,SMF-006",smurfing,SAR_READY,,85,ESCALATE,2026-09-01 21:52:24,./mockdata\reports\SAR_CASE-1YXQ2BP.pdf

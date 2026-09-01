@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 from datetime import datetime
 from xml.sax.saxutils import escape
 
@@ -22,6 +23,28 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import Preformatted, SimpleDocTemplate, Spacer, Table, Paragraph
 
 from agents.grok_client import GrokClient
+from evidence.sanitizer import load_aliases
+
+# alias tokens look like ACC-0001 / TXN-0012 (pure-digit bodies)
+ALIAS_RE = re.compile(r"\b(?:ACC|CUS|TXN|DEV|GEO|BEN|EXT|ALR|GTA)-[0-9]{4}\b")
+
+# the only SAR fields the backend is approved to restore
+RESTORABLE_FIELDS = ("executive_summary", "suspicious_activity_narrative",
+                     "subject_analysis", "assessment_conclusion")
+
+
+def resolve_aliases(text: str, alias_map: dict[str, str]) -> str:
+    """Controlled backend-side alias restoration: replace ONLY exact alias
+    tokens that exist in the mapping; unknown aliases and all other text are
+    preserved unchanged. The mapping never leaves the backend."""
+    return ALIAS_RE.sub(lambda m: alias_map.get(m.group(0), m.group(0)), text)
+
+
+def resolve_narrative(narrative: dict, alias_map: dict[str, str]) -> dict:
+    """Resolve aliases in the approved narrative fields only."""
+    return {k: (resolve_aliases(v, alias_map) if k in RESTORABLE_FIELDS
+                and isinstance(v, str) else v)
+            for k, v in narrative.items()}
 
 AUDIT_READY_SCHEMA = [
     "case_id", "account_id", "created_at", "primary_trigger", "alert_ids",
@@ -82,7 +105,12 @@ def _kv_table(rows):
 
 
 def _build_pdf(path: str, case: dict, account_id: str, narrative: dict,
-               dossier: dict):
+               dossier: dict, alias_map: dict | None = None):
+    am = alias_map or {}
+
+    def _dump(obj, cap):
+        return resolve_aliases(json.dumps(obj, indent=1, default=str)[:cap], am)
+
     styles = getSampleStyleSheet()
     story = [
         Paragraph("Suspicious Activity Report (SAR)", styles["Title"]),
@@ -112,25 +140,24 @@ def _build_pdf(path: str, case: dict, account_id: str, narrative: dict,
         Paragraph(escape(narrative.get("assessment_conclusion", "")), styles["Normal"]),
         Spacer(1, 10),
         _section(styles, "6. Hypothesis agents (LLM responses)"),
-        Preformatted(json.dumps(dossier["agents"], indent=1, default=str)[:3500],
+        Preformatted(_dump(dossier["agents"], 3500),
                      ParagraphStyle("mono", fontName="Courier", fontSize=6.5, leading=8)),
         Spacer(1, 8),
         _section(styles, "7. Regulatory findings & RAG references"),
-        Preformatted(json.dumps({"rules_engine": dossier["regulatory"],
-                                 "rag": dossier["regulatory_rag"]},
-                                indent=1, default=str)[:2500],
+        Preformatted(_dump({"rules_engine": dossier["regulatory"],
+                           "rag": dossier["regulatory_rag"]}, 2500),
                      ParagraphStyle("mono2", fontName="Courier", fontSize=6.5, leading=8)),
         Spacer(1, 8),
         _section(styles, "8. Investigation auditor"),
-        Preformatted(json.dumps(dossier["auditor"], indent=1, default=str)[:1800],
+        Preformatted(_dump(dossier["auditor"], 1800),
                      ParagraphStyle("mono3", fontName="Courier", fontSize=6.5, leading=8)),
         Spacer(1, 8),
         _section(styles, "9. Next-best-action"),
-        Preformatted(json.dumps(dossier["next_best_action"], indent=1, default=str),
+        Preformatted(_dump(dossier["next_best_action"], 2000),
                      ParagraphStyle("mono4", fontName="Courier", fontSize=6.5, leading=8)),
         Spacer(1, 8),
         _section(styles, "10. Audit trail"),
-        Preformatted(json.dumps(dossier["audit_trail"], indent=1, default=str)[:2200],
+        Preformatted(_dump(dossier["audit_trail"], 2200),
                      ParagraphStyle("mono5", fontName="Courier", fontSize=6.5, leading=8)),
         Spacer(1, 8),
         _section(styles, "11. Final disposition"),
@@ -138,7 +165,7 @@ def _build_pdf(path: str, case: dict, account_id: str, narrative: dict,
                          f"Recommended action: {dossier['next_best_action']['action']}. "
                          f"Routing: {dossier['auditor']['routing']}."), styles["Normal"]),
     ]
-    tmp = path + ".tmp"
+    tmp = path + ".tmp"          # demasked intermediate - encrypted then removed
     SimpleDocTemplate(tmp, pagesize=A4).build(story)
     # password-protect
     writer = PdfWriter()
@@ -180,23 +207,20 @@ def _mark_audit_ready(mockdata_dir: str, case: dict, dossier: dict,
 
 
 def generate(case: dict, evidence: dict, analysis: dict, trail: list[dict],
-             mockdata_dir: str) -> dict:
+             mockdata_dir: str, alias_map: dict[str, str] | None = None) -> dict:
+    alias_map = alias_map or {}
     account_id = case["account_id"]
     reports_dir = os.path.join(mockdata_dir, "reports")
     os.makedirs(reports_dir, exist_ok=True)
     pdf_path = os.path.join(reports_dir, f"SAR_{case['case_id']}.pdf")
 
     dossier = _compact_dossier(evidence, analysis, trail)
-    narrative = sar_summary(dossier)
-    _build_pdf(pdf_path, case, account_id, narrative, dossier)
+    narrative = sar_summary(dossier)          # LLM sees aliases ONLY
+    # trusted backend restores aliases for the approved narrative fields;
+    # the demasked text exists only inside the PDF, never in an API response
+    resolved = resolve_narrative(narrative, alias_map)
+    _build_pdf(pdf_path, case, account_id, resolved, dossier, alias_map)
     _mark_audit_ready(mockdata_dir, case, dossier, pdf_path)
 
     pwd = password_for(account_id)
-    return {
-        "report_path": pdf_path,
-        "password": pwd,
-        "alert": (f"SAR report generated and saved to {pdf_path}. "
-                  f"The PDF password is the account holder's account id last four "
-                  f"digits (for this account: '{pwd}')."),
-        "narrative": narrative,
-    }
+    return {"report_path": pdf_path, "password": pwd}

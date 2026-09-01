@@ -278,3 +278,54 @@ Provider notes: Groq free tier limits requests to 8000 tokens/minute, so the
 SAR dossier is trimmed to fit; the client retries a 429 once after 30s
 (still a real LLM call). Pipeline reruns preserve case lifecycle statuses
 (SENIOR / SAR_READY). Full pytest suite: 27 passed.
+
+## PII boundary for SAR + agent responses (alias restoration layer)
+
+The SAR and investigation-agent flows now enforce a strict alias boundary:
+
+```
+RAW BANK DATA -> PII sanitizer/aliasing -> masked dossier -> SAR/agent LLM
+   (aliases only, mapping never sent) -> TRUSTED BACKEND alias restoration
+   -> demasked SAR PDF -> password encryption -> frontend receives PDF only
+```
+
+### What changed and why
+
+- `evidence/sanitizer.py`: `PIISanitizer` now exposes `alias_map()`,
+  `save_aliases()` and `load_aliases()` so the mapping it already builds can
+  be persisted (`mockdata/evidence/{case_id}_aliases.json`, gitignored) and
+  reused by the backend. The mapping is a trusted-backend secret: it is
+  never sent to any LLM and never returned by any API.
+- `reports/sar.py`: added a controlled `resolve_aliases()` /
+  `resolve_narrative()` - only exact alias tokens that exist in the map are
+  replaced, only the four approved narrative fields (+ PDF appendix JSON
+  blocks) are restored, unknown aliases and plain text are preserved. The
+  SAR LLM still receives the masked dossier and keeps returning aliases;
+  restoration is deterministic backend code (no LLM demasking, no second
+  call). The demasked narrative exists only inside the PDF.
+- `main.py`:
+  - `POST /cases/{id}/investigate` persists the alias map (backend-only).
+  - `POST /cases/{id}/sar-report` now returns ONLY the password-protected
+    PDF (`FileResponse`, `X-SAR-Password-Hint` header) - no demasked JSON
+    narrative, no mapping. The demasked temp PDF is encrypted and removed.
+  - New `POST /cases/{id}/agents/reveal`: authorized PII view of the three
+    stored agent responses. It resolves aliases presentation-side against
+    the backend map, never reruns the LLM, preserves the original masked
+    output (masked <-> authorized views use the same analysis), and records
+    a PII-free `PII_REVEAL` event in the audit trail.
+  - JUNIOR remains queue-restricted but can view/generate for cases they
+    worked that reached SAR_READY.
+- `agents/grok_client.py`: retries transient provider 429 / json_validate
+  400 errors (same real LLM call; still no offline fallback).
+
+### Verified (one case, CASE-1YXQ2BP, live LLM)
+
+- SAR endpoint returns `application/pdf` only; PDF is encrypted and opens
+  with the account-id-derived password; real ids restored (e.g.
+  `ACC-29GD8AF`), aliases absent; unencrypted temp file removed.
+- Masked analysis view contains aliases only; reveal view restores real
+  ids; `PII_REVEAL` + `SAR_GENERATED` audit events recorded.
+- New `tests/test_sar_pii.py` covers: masked LLM input, mapping never
+  reaches the LLM, backend restoration, unknown-alias safety, restored
+  values inside the PDF, PDF encryption, PDF-only API response, and
+  existing-behavior preservation. Full suite: 35 passed.

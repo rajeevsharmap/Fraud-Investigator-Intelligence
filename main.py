@@ -29,7 +29,7 @@ from detection.loader import BankData
 from detection.network_layer import build_case_network
 from detection.pipeline import run_pipeline
 from evidence.builder import EvidenceBuilder
-from evidence.sanitizer import PIISanitizer
+from evidence.sanitizer import PIISanitizer, load_aliases
 from regulatory.rag import retrieve as rag_retrieve
 from regulatory.rules_engine import evaluate as regulatory_evaluate
 
@@ -90,7 +90,9 @@ def list_cases(x_investigator_role: str | None = Header(default=None)):
 def _get_case(case_id: str, role: str) -> dict:
     for c in _read_csv("cases.csv"):
         if c["case_id"] == case_id:
-            if role == "JUNIOR" and c["status"] != "JUNIOR":
+            # Junior keeps queue visibility, but may still view cases they
+            # worked that have been finalized (SAR_READY)
+            if role == "JUNIOR" and c["status"] not in ("JUNIOR", "SAR_READY"):
                 raise HTTPException(status_code=403,
                                     detail="case not authorized for JUNIOR role")
             return c
@@ -298,16 +300,23 @@ def _update_case_status(case_id: str, new_status: str):
 # ---------------- Checkpoint 7: SAR report + audit-ready case ----------------
 
 from reports.sar import generate as generate_sar   # noqa: E402
+from fastapi.responses import FileResponse   # noqa: E402
 
 
 @app.post("/cases/{case_id}/sar-report")
 def sar_report(case_id: str, x_investigator_role: str | None = Header(default=None)):
-    """SAR Report button (JUNIOR or SENIOR). Summarizes the full investigation
-    dossier - evidence, the three Grok agent responses, regulatory findings,
-    RAG references, auditor result, next-best-action and audit trail - into a
-    password-protected PDF, then moves the case to audit_ready_cases.csv."""
+    """SAR Report button (JUNIOR or SENIOR). Flow: masked dossier -> SAR LLM
+    (aliases only) -> trusted-backend alias restoration -> demasked PDF ->
+    password encryption. The API returns ONLY the protected PDF file - no
+    demasked JSON narrative and no alias mapping (Architecture.md s34/s21)."""
     role = _require_role(x_investigator_role)
-    case = _get_case(case_id, role)
+    case = next((c for c in _read_csv("cases.csv") if c["case_id"] == case_id), None)
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"case {case_id} not found")
+    # both JUNIOR and SENIOR can generate the SAR report for a finalized case;
+    # active cases keep normal queue visibility
+    if case["status"] != "SAR_READY":
+        _get_case(case_id, role)
 
     ev_path = _evidence_path(case_id, "")
     an_path = _evidence_path(case_id, "_analysis")
@@ -315,13 +324,33 @@ def sar_report(case_id: str, x_investigator_role: str | None = Header(default=No
         raise HTTPException(status_code=404, detail="no analysis yet - run POST "
                             "/cases/{case_id}/investigate then POST "
                             "/cases/{case_id}/analysis first")
+
+    # backend-only alias map: load persisted map, or deterministically rebuild
+    # it from the already-sanitized evidence (never sent to the LLM / API)
+    al_path = os.path.join(MOCKDATA_DIR, "evidence", f"{case_id}_aliases.json")
+    alias_map = load_aliases(al_path)
+    if not alias_map:
+        alerts = [a for a in _read_csv("suspected_alerts.csv")
+                  if a["alert_id"] in (set(case["alert_ids"].split(","))
+                                       if case["alert_ids"] else set())]
+        case2 = case
+        sanitizer = PIISanitizer()
+        sanitizer.mask_package(EvidenceBuilder(
+            app.state.data, os.path.join(MOCKDATA_DIR, "evidence"))
+            .build(case2, alerts), role)
+        alias_map = sanitizer.alias_map()
+        sanitizer.save_aliases(al_path)
+
     trail = read_trail(MOCKDATA_DIR, case_id)
     result = generate_sar(case, _load_json(ev_path), _load_json(an_path), trail,
-                          MOCKDATA_DIR)
-    record_event(MOCKDATA_DIR, case_id, role, "SAR_GENERATED", result["report_path"])
-    return {"case_id": case_id, "status": "SAR_READY", "generated_by": role,
-            "report_path": result["report_path"], "password": result["password"],
-            "alert": result["alert"], "narrative": result["narrative"]}
+                          MOCKDATA_DIR, alias_map)
+    record_event(MOCKDATA_DIR, case_id, role, "SAR_GENERATED",
+                 os.path.basename(result["report_path"]))   # no PII in event
+    return FileResponse(result["report_path"], media_type="application/pdf",
+                        filename=f"SAR_{case_id}.pdf",
+                        headers={"X-SAR-Password-Hint":
+                                 "account holder's account id - last four "
+                                 "characters"})
 
 
 # ---------------- Checkpoint 7 (cont.): case memory / reference cases ----------------
@@ -360,3 +389,56 @@ def list_reference_cases(x_investigator_role: str | None = Header(default=None))
     role = _require_role(x_investigator_role)
     refs = read_references(MOCKDATA_DIR)
     return {"role": role, "count": len(refs), "reference_cases": refs}
+
+
+# ---------------- Authorized PII reveal for the three agent responses ----------------
+
+from reports.sar import resolve_aliases as _resolve_text   # noqa: E402
+
+
+def _resolve_presentation(obj, alias_map: dict):
+    """Deterministic, application-side alias restoration for presentation.
+    Recurses over the stored LLM response structure; only aliases that exist
+    in the backend map are replaced; unknown text is preserved."""
+    if isinstance(obj, dict):
+        return {k: _resolve_presentation(v, alias_map) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_presentation(v, alias_map) for v in obj]
+    if isinstance(obj, str):
+        return _resolve_text(obj, alias_map)
+    return obj
+
+
+@app.post("/cases/{case_id}/agents/reveal")
+def reveal_agent_pii(case_id: str, x_investigator_role: str | None = Header(default=None)):
+    """Authorized PII view of the three stored agent responses. No LLM rerun:
+    the original masked LLM output is preserved unchanged and this endpoint
+    only resolves aliases against the backend mapping after authorization.
+    Every reveal is recorded in the audit trail; the mapping itself is never
+    returned."""
+    role = _require_role(x_investigator_role)
+    _get_case(case_id, role)
+
+    agents_path = _evidence_path(case_id, "_agents")
+    if not os.path.exists(agents_path):
+        raise HTTPException(status_code=404, detail="no agent responses yet - "
+                            "POST /cases/{case_id}/investigate first")
+    masked = _load_json(agents_path)          # original LLM output, unchanged
+
+    al_path = os.path.join(MOCKDATA_DIR, "evidence", f"{case_id}_aliases.json")
+    alias_map = load_aliases(al_path)
+    if not alias_map:                          # deterministic rebuild fallback
+        case2, alerts = _case_with_alerts(case_id, role)
+        sanitizer = PIISanitizer()
+        sanitizer.mask_package(EvidenceBuilder(
+            app.state.data, os.path.join(MOCKDATA_DIR, "evidence"))
+            .build(case2, alerts), role)
+        alias_map = sanitizer.alias_map()
+        sanitizer.save_aliases(al_path)
+
+    record_event(MOCKDATA_DIR, case_id, role, "PII_REVEAL",
+                 "authorized reveal of three agent responses (aliases resolved "
+                 "backend-side; no LLM call)")
+    return {"case_id": case_id, "view": "authorized_pii",
+            "agents": _resolve_presentation(masked, alias_map),
+            "masked_view_available": True}

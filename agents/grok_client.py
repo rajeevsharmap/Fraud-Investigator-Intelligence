@@ -50,14 +50,15 @@ class GrokClient:
                      "Authorization": f"Bearer {self.api_key}",
                      "User-Agent": "TekmerionIntelligence/1.0",
                      "Accept": "application/json"})
+        import time
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 body = json.load(resp)
         except urllib.error.HTTPError as e:
             detail = e.read()[:200].decode("utf-8", "ignore")
-            if e.code == 429:            # provider rate limit: wait, retry once
-                import time
-                time.sleep(30)
+            # transient provider failures: wait and retry the same real call
+            if e.code == 429 or (e.code == 400 and "json_validate_failed" in detail):
+                time.sleep(20)
                 with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                     body = json.load(resp)
             else:
