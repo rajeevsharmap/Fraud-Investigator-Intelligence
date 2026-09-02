@@ -1,0 +1,84 @@
+.workspace-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 300px);
+  align-items: start;
+  gap: 24px;
+  width: 100%;
+}
+.workspace-main,
+.workspace-side {
+  min-width: 0;
+  position: static;
+  width: auto;
+}
+.workspace-main {
+  grid-template-columns: minmax(0, 1fr);
+}
+.workspace-side {
+  align-self: start;
+}
+.workspace-side .panel {
+  position: static;
+  width: 100%;
+}
+.workspace-main > .section-title {
+  width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.workspace-main > .section-title > div {
+  min-width: 0;
+}
+.workspace-main > .section-title .button {
+  margin-left: auto;
+}
+.action-panel input,
+.action-panel textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #0b141b;
+  color: var(--text);
+  padding: 10px;
+  font-size: 12px;
+}
+.action-panel input { height: 38px; margin-bottom: 10px; }
+.action-panel textarea { min-height: 88px; resize: vertical; }
+.access-label { color: #a9bdc5; font-size: 11px; letter-spacing: .04em; margin-bottom: 7px; }
+.access-input { width: 100%; max-width: 430px; height: 42px; border: 1px solid var(--line); border-radius: 3px; background: #0b141b; color: var(--text); padding: 10px 12px; margin-bottom: 16px; outline: none; }
+.access-input:focus, .action-panel input:focus, .action-panel textarea:focus { border-color: var(--cyan); box-shadow: 0 0 0 2px #63c7d920; }
+.enter-button { min-height: 42px; }
+.field-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: #a9bdc5;
+  font-size: 11px;
+  margin: 10px 0 6px;
+}
+.field-label span,
+.field-note { color: var(--muted); font-size: 10px; }
+.field-note { line-height: 1.5; margin: 0 0 8px; }
+.success-detail { display: block; color: #9bb6a2; font-size: 11px; margin-top: 4px; line-height: 1.5; }
+.return-button { margin-top: 10px; width: 100%; }
+.access-state {
+  min-height: 320px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 12px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  padding: 42px;
+  color: var(--muted);
+}
+.access-state svg { color: var(--amber); }
+.access-state h2 { margin: 0; color: var(--text); font: 600 22px 'Space Grotesk'; }
+.access-state p { max-width: 560px; margin: 0 0 8px; line-height: 1.6; }
+@media (max-width: 900px) {
+  .workspace-grid { grid-template-columns: 1fr; }
+  .workspace-side { grid-row: auto; }
+  .workspace-main > .section-title .button { margin-left: 0; }
+}
