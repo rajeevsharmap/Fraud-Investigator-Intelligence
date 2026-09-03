@@ -33,6 +33,7 @@ import {
 } from "react-router-dom";
 import { ApiError, api } from "./lib/api";
 import { useRole } from "./role";
+import { SeniorAccountDeepDive } from "./seniorDeepDive";
 import type { DataRecord, Role } from "./types";
 import {
   EmptyState,
@@ -181,6 +182,9 @@ function Shell({ children }: { children: React.ReactNode }) {
     { to: "/escalated", label: "Escalated Cases", icon: Users },
     { to: "/audit", label: "Audit-Ready Cases", icon: Shield },
     { to: "/saved", label: "Reference Cases", icon: FileText },
+    ...(role === "SENIOR"
+      ? [{ to: "/senior-deep-dive", label: "Senior Deep-Dive", icon: Search }]
+      : []),
   ];
   return (
     <div className="app-shell">
@@ -1172,6 +1176,10 @@ export function App() {
                 />
                 <Route path="/audit" element={<CaseQueue mode="audit" />} />
                 <Route path="/saved" element={<References />} />
+                <Route
+                  path="/senior-deep-dive"
+                  element={<SeniorAccountDeepDive />}
+                />
                 <Route path="/cases/:caseId" element={<CaseWorkspace />} />
                 <Route path="*" element={<Navigate to="/alerts" replace />} />
               </Routes>
