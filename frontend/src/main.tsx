@@ -5,6 +5,7 @@ import { App } from './App'
 import { RoleProvider } from './role'
 import './styles.css'
 import './layout-overrides.css'
+import './login-overrides.css'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode><BrowserRouter><RoleProvider><App /></RoleProvider></BrowserRouter></StrictMode>,
