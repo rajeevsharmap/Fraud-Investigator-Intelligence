@@ -9,6 +9,8 @@ Hard boundary between raw banking data and LLM-safe evidence:
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 from collections import defaultdict
 
@@ -68,3 +70,23 @@ class PIISanitizer:
         safe["role"] = role
         safe["pii_sanitized"] = True
         return safe
+
+    def alias_map(self) -> dict[str, str]:
+        """Reverse mapping (alias -> raw id) for BACKEND-SIDE restoration only.
+        Never send this to the LLM or return it from an API."""
+        return {v: k for k, v in self.aliases.items()}
+
+    def save_aliases(self, path: str):
+        """Persist the alias map to a backend-only file (trusted zone)."""
+        import os
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.alias_map(), f)
+
+
+def load_aliases(path: str) -> dict[str, str]:
+    """Load a persisted alias map; empty dict when absent."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
