@@ -23,14 +23,21 @@ export const value = (
   fallback = "—",
 ) => {
   if (!record) return fallback;
+
   for (const key of keys) {
     const item = record[key];
-    if (item !== undefined && item !== null && item !== "") return String(item);
+
+    if (item !== undefined && item !== null && item !== "") {
+      return String(item);
+    }
   }
+
   return fallback;
 };
+
 export const prettyKey = (key: string) =>
   key.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+
 export const formatValue = (item: unknown) =>
   typeof item === "object" && item !== null
     ? JSON.stringify(item)
@@ -38,12 +45,14 @@ export const formatValue = (item: unknown) =>
 
 export function StatusBadge({ status }: { status: string }) {
   const normalized = status.toUpperCase();
+
   const tone =
     normalized.includes("SENIOR") || normalized.includes("ESCALAT")
       ? "amber"
       : normalized.includes("SAR")
         ? "green"
         : "blue";
+
   return (
     <span className={`status-badge ${tone}`}>
       <span className="status-dot" />
@@ -51,6 +60,7 @@ export function StatusBadge({ status }: { status: string }) {
     </span>
   );
 }
+
 export function LoadingState({
   label = "Loading intelligence",
 }: {
@@ -63,6 +73,7 @@ export function LoadingState({
     </div>
   );
 }
+
 export function ErrorState({
   message,
   retry,
@@ -73,9 +84,11 @@ export function ErrorState({
   return (
     <div className="state error-state">
       <XCircle size={22} />
+
       <div>
         <strong>Unable to load this view</strong>
         <p>{message}</p>
+
         {retry && (
           <button className="button secondary" onClick={retry}>
             <RefreshCw size={15} />
@@ -86,6 +99,7 @@ export function ErrorState({
     </div>
   );
 }
+
 export function EmptyState({
   title,
   detail,
@@ -121,9 +135,15 @@ export function Metric({
     </div>
   );
 }
+
 export function JsonBlock({ data }: { data: unknown }) {
-  return <pre className="json-block">{JSON.stringify(data, null, 2)}</pre>;
+  return (
+    <pre className="json-block">
+      {JSON.stringify(data, null, 2)}
+    </pre>
+  );
 }
+
 export function RecordGrid({ record }: { record: DataRecord }) {
   return (
     <div className="record-grid">
@@ -136,7 +156,12 @@ export function RecordGrid({ record }: { record: DataRecord }) {
     </div>
   );
 }
-export function Workflow({ agents }: { agents: DataRecord | null }) {
+
+export function Workflow({
+  agents,
+}: {
+  agents: DataRecord | null;
+}) {
   const labels = [
     "Detection Agent",
     "Genuine Hypothesis",
@@ -145,29 +170,49 @@ export function Workflow({ agents }: { agents: DataRecord | null }) {
     "Investigator Agent",
     "Next-Best Action",
   ];
+
+  const keys = [
+    "detection",
+    "legitimate_hypothesis",
+    "scammer_hypothesis",
+    "contradiction",
+    "investigator",
+    "next_best_action",
+  ];
+
   return (
     <div className="workflow">
       {labels.map((label, index) => {
-        const key = [
-          "detection",
-          "legitimate_hypothesis",
-          "scammer_hypothesis",
-          "contradiction",
-          "investigator",
-          "next_best_action",
-        ][index];
-        const result = agents?.[key];
+        const key = keys[index];
+
+        const result =
+          agents?.[key] ??
+          (key === "legitimate_hypothesis"
+            ? agents?.legitimate
+            : undefined) ??
+          (key === "scammer_hypothesis"
+            ? agents?.scammer
+            : undefined);
+
         return (
           <div className="workflow-step" key={label}>
             <div className={`workflow-icon ${result ? "done" : ""}`}>
-              {result ? <CheckCircle2 size={16} /> : <CircleDashed size={16} />}
+              {result ? (
+                <CheckCircle2 size={16} />
+              ) : (
+                <CircleDashed size={16} />
+              )}
             </div>
+
             <div>
               <strong>{label}</strong>
               <span>
-                {result ? "Backend result available" : "Pending backend result"}
+                {result
+                  ? "Backend result available"
+                  : "Pending backend result"}
               </span>
             </div>
+
             {index < labels.length - 1 && (
               <ArrowRight className="workflow-arrow" size={14} />
             )}
@@ -177,6 +222,7 @@ export function Workflow({ agents }: { agents: DataRecord | null }) {
     </div>
   );
 }
+
 export const icons = {
   alerts: AlertTriangle,
   escalated: Users,

@@ -48,9 +48,13 @@ def audit(case: dict, evidence: dict, agents: dict, regulatory: dict) -> dict:
         and not evidence.get("network", {}).get("stats", {}).get("edges", 0) else "")
     add("security_for_swap", "account_swap" not in flows
         or bool(evidence.get("security_timeline")))
-    add("agents_output", bool(agents.get("scammer_hypothesis")
-        and agents.get("legitimate_hypothesis")
-        and agents.get("contradiction")))
+    scammer_output = agents.get("scammer") or agents.get("scammer_hypothesis")
+    legitimate_output = agents.get("legitimate") or agents.get("legitimate_hypothesis")
+    add("agents_output", bool(
+        scammer_output
+        and legitimate_output
+        and agents.get("contradiction")
+    ))
     verdict = agents.get("contradiction", {}).get("verdict", "")
     add("verdict", verdict in ("scammer", "legitimate", "insufficient_evidence"))
     add("regulatory_findings", bool(regulatory.get("findings")))

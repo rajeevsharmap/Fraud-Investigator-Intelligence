@@ -19,8 +19,12 @@ try:
 except ImportError:
     pass
 
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:  # allow deterministic modules/tests to import without SDK
+    genai = None
+    types = None
 
 
 MODEL = os.environ.get(
@@ -43,6 +47,11 @@ class GeminiClient:
 
         if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY not configured")
+
+        if genai is None or types is None:
+            raise RuntimeError(
+                "google-genai package not installed; install backend requirements"
+            )
 
         self.client = genai.Client(api_key=self.api_key)
 

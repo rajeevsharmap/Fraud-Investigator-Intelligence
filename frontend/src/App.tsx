@@ -53,6 +53,23 @@ import {
   value,
 } from "./components";
 
+// The backend keeps the hypothesis/contradiction agent JSON contract unchanged.
+// This explicit frontend type only describes the container so TypeScript can
+// safely access the existing agent fields without changing their JSON shape.
+type AgentResults = {
+  [key: string]: unknown;
+  scammer?: unknown;
+  legitimate?: unknown;
+  scammer_hypothesis?: unknown;
+  legitimate_hypothesis?: unknown;
+  contradiction?: unknown;
+};
+
+type InvestigationResponse = DataRecord & {
+  agents?: AgentResults;
+  llm_safe_evidence?: unknown;
+};
+
 // Local index of case ids this browser session has opened. The backend's
 // bulk /cases response is pre-filtered per role (JUNIOR only ever sees
 // status == JUNIOR), so a case a Junior worked that later becomes SAR_READY
@@ -768,9 +785,10 @@ function Overview({
 }) {
   const { role } = useRole();
   const [investigating, setInvestigating] = useState(false);
-  const [investigation, setInvestigation] = useState<DataRecord | null>(null);
+  const [investigation, setInvestigation] = useState<InvestigationResponse | null>(null);
   const [analysis, setAnalysis] = useState<DataRecord | null>(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [resolvingContradiction, setResolvingContradiction] = useState(false);
   const [reason, setReason] = useState("");
   const [message, setMessage] = useState("");
   const [actionError, setActionError] = useState("");
@@ -782,7 +800,7 @@ function Overview({
     setActionError("");
     try {
       const result = await api.investigate(caseId);
-      setInvestigation(result as unknown as DataRecord);
+      setInvestigation(result as unknown as InvestigationResponse);
     } catch (error) {
       setActionError(
         userFacingError(
@@ -793,6 +811,31 @@ function Overview({
       console.error("[SENTINEL] investigation failed", error);
     } finally {
       setInvestigating(false);
+    }
+  };
+  const resolveContradiction = async () => {
+    setResolvingContradiction(true);
+    setActionError("");
+    try {
+      const result = await api.resolveContradiction(caseId);
+      const resolvedAgents = result.agents as AgentResults;
+      setInvestigation((previous) => {
+        if (!previous) return null;
+
+        return {
+          ...previous,
+          agents: resolvedAgents,
+        };
+      });
+    } catch (error) {
+      setActionError(
+        userFacingError(
+          error,
+          "Contradiction resolution could not be completed.",
+        ),
+      );
+    } finally {
+      setResolvingContradiction(false);
     }
   };
   const runAnalysis = async () => {
@@ -892,8 +935,8 @@ function Overview({
         {investigation && (
           <div className="panel">
             <h3>Investigation response</h3>
-            <Workflow agents={investigation.agents as DataRecord} />
-            <HypothesisResults agents={investigation.agents as DataRecord} />
+            <Workflow agents={(investigation.agents || null) as DataRecord | null} />
+            <HypothesisResults agents={investigation.agents || null} />
             <JsonBlock data={investigation.llm_safe_evidence} />
           </div>
         )}
@@ -903,13 +946,25 @@ function Overview({
               <h3>Analysis workflow</h3>
               <p>Only persisted backend results are shown.</p>
             </div>
-            <button
-              className="button secondary"
-              disabled={analysisLoading}
-              onClick={runAnalysis}
-            >
-              {analysisLoading ? "Running..." : "Run analysis"}
-            </button>
+            {investigation?.agents && !investigation.agents.contradiction ? (
+              <button
+                className="button secondary"
+                disabled={resolvingContradiction}
+                onClick={resolveContradiction}
+              >
+                {resolvingContradiction
+                  ? "Resolving..."
+                  : "Resolve Contradiction"}
+              </button>
+            ) : (
+              <button
+                className="button secondary"
+                disabled={analysisLoading || !investigation?.agents?.contradiction}
+                onClick={runAnalysis}
+              >
+                {analysisLoading ? "Running..." : "Run analysis"}
+              </button>
+            )}
           </div>
           <Workflow agents={analysis?.agents as DataRecord} />
           {analysis && <JsonBlock data={analysis} />}
@@ -1658,13 +1713,12 @@ function PipelineSteps({ steps }: { steps: { label: string; done: boolean }[] })
   );
 }
 
-// The three Grok hypothesis agents (Checkpoint 4), rendered from stored
-// backend responses only.
-function HypothesisResults({ agents }: { agents: DataRecord | null }) {
+// The three hypothesis agents, rendered from stored backend responses only.
+function HypothesisResults({ agents }: { agents: AgentResults | null }) {
   if (!agents) return null;
   const sections: [string, unknown][] = [
-    ["Fraud / scam hypothesis", agents.scammer_hypothesis],
-    ["Legitimate hypothesis", agents.legitimate_hypothesis],
+    ["Fraud / scam hypothesis", agents.scammer ?? agents.scammer_hypothesis],
+    ["Legitimate hypothesis", agents.legitimate ?? agents.legitimate_hypothesis],
     ["Contradiction", agents.contradiction],
   ];
   return (
@@ -1702,9 +1756,10 @@ function SarAudits({
     "loading" | "ready" | "notrun"
   >("loading");
   const [analysis, setAnalysis] = useState<DataRecord | null>(null);
-  const [agents, setAgents] = useState<DataRecord | null>(null);
+  const [agents, setAgents] = useState<AgentResults | null>(null);
   const [investigating, setInvestigating] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
+  const [resolvingContradiction, setResolvingContradiction] = useState(false);
   const [sarLoading, setSarLoading] = useState(false);
   const [sarDone, setSarDone] = useState(false);
   const [sarError, setSarError] = useState("");
@@ -1741,7 +1796,7 @@ function SarAudits({
       .getAnalysis(caseId)
       .then((result) => {
         setAnalysis(result);
-        setAgents((result.agents || null) as DataRecord | null);
+        setAgents((result.agents || null) as AgentResults | null);
         setAnalysisState("ready");
       })
       .catch((error) => {
@@ -1756,10 +1811,10 @@ function SarAudits({
     setProgress("");
     try {
       const result = await api.investigate(caseId);
-      setAgents((result.agents || null) as DataRecord | null);
+      setAgents((result.agents || null) as AgentResults | null);
       setEvidenceState("ready");
       setProgress(
-        "Evidence bundle sanitized and sent to the three hypothesis agents (scammer, legitimate, contradiction). Run the analysis to score the investigation.",
+        "Evidence bundle prepared. Scammer and Legitimate hypotheses completed independently. Resolve Contradiction to continue.",
       );
       loadAudit();
     } catch (error) {
@@ -1771,6 +1826,29 @@ function SarAudits({
       setInvestigating(false);
     }
   };
+  const resolveContradiction = async () => {
+    setResolvingContradiction(true);
+    setSarError("");
+    setProgress("");
+    try {
+      const result = await api.resolveContradiction(caseId);
+      setAgents((result.agents || null) as AgentResults | null);
+      setProgress(
+        "Contradiction resolved from the two independent hypotheses and the sanitized evidence. Run analysis to continue.",
+      );
+      loadAudit();
+    } catch (error) {
+      setSarError(
+        userFacingError(
+          error,
+          "Contradiction resolution could not be completed.",
+        ),
+      );
+      console.error("[SENTINEL] contradiction resolution failed", error);
+    } finally {
+      setResolvingContradiction(false);
+    }
+  };
   const runAnalysis = async () => {
     setAnalyzing(true);
     setSarError("");
@@ -1778,7 +1856,7 @@ function SarAudits({
     try {
       const result = await api.runAnalysis(caseId);
       setAnalysis(result);
-      setAgents((result.agents || null) as DataRecord | null);
+      setAgents((result.agents || null) as AgentResults | null);
       setAnalysisState("ready");
       setProgress(
         "Analysis stored: regulatory findings, completeness score, routing and next-best-action are ready. The SAR PDF can now be generated.",
@@ -1826,6 +1904,7 @@ function SarAudits({
   const pipelineSteps = [
     { label: "Evidence bundle", done: evidenceState === "ready" },
     { label: "Hypothesis agents", done: !!agents },
+    { label: "Contradiction", done: !!agents?.contradiction },
     { label: "Regulatory + auditor", done: !!analysis },
     { label: "SAR report", done: sarDone },
   ];
@@ -1837,8 +1916,8 @@ function SarAudits({
             <div>
               <h2>Investigation pipeline</h2>
               <p>
-                Evidence bundle → three hypothesis agents → regulatory
-                analysis → SAR report.
+                Evidence bundle → Scammer + Legitimate hypotheses → Contradiction
+                → regulatory/audit analysis → SAR report.
               </p>
             </div>
             {analysisState !== "loading" && !agents && (
@@ -1857,7 +1936,23 @@ function SarAudits({
                 )}
               </button>
             )}
-            {agents && !analysis && (
+            {agents && !agents.contradiction && (
+              <button
+                className="button primary"
+                disabled={resolvingContradiction}
+                onClick={resolveContradiction}
+              >
+                {resolvingContradiction ? (
+                  "Resolving..."
+                ) : (
+                  <>
+                    <Play size={15} />
+                    Resolve Contradiction
+                  </>
+                )}
+              </button>
+            )}
+            {Boolean(agents?.contradiction) && !analysis && (
               <button
                 className="button primary"
                 disabled={analyzing}
@@ -1895,8 +1990,29 @@ function SarAudits({
           ) : (
             <EmptyState
               title="Investigation not started"
-              detail="Start the investigation to bundle sanitized evidence and run the three hypothesis agents on the backend."
+              detail="Start the investigation to bundle sanitized evidence and run the Scammer and Legitimate hypotheses in parallel."
             />
+          )}
+          {Array.isArray(analysis?.broken_rules) && (
+            <div className="evidence-section">
+              <h3>Regulatory rules triggered</h3>
+              {(analysis.broken_rules as DataRecord[]).length ? (
+                <div className="record-grid">
+                  {(analysis.broken_rules as DataRecord[]).map((rule, index) => (
+                    <div className="record-item" key={String(rule.rule_id || index)}>
+                      <span>{String(rule.rule_id || "Rule")}</span>
+                      <strong>
+                        {String(rule.title || "")}
+                        {rule.severity ? ` · ${String(rule.severity)}` : ""}
+                        {rule.detail ? ` — ${String(rule.detail)}` : ""}
+                      </strong>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="muted">No regulatory rules were triggered.</p>
+              )}
+            </div>
           )}
           {analysis && <JsonBlock data={analysis} />}
         </div>

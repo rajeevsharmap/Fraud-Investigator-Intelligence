@@ -6,8 +6,9 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 networkx>=3.0
 
-# Checkpoint 4 - Grok key config (python-dotenv)
+# Checkpoint 4 - Gemini Flash 3.6 LLM configuration
 python-dotenv>=1.0.0
+google-genai>=1.0.0
 
 # Tests
 pytest>=8.0.0

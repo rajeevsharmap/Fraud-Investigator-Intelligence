@@ -29,6 +29,7 @@ from agents.gemini_client import GeminiClient
 from pypdf import PdfReader, PdfWriter
 
 from reportlab.lib import colors
+from reportlab.pdfgen import canvas
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -249,26 +250,18 @@ def _extract_account_id(dossier: dict[str, Any]) -> str:
 
 
 def _password_from_account_id(account_id: str) -> str:
-    """Create the case PDF password.
+    """Return the configured SAR PDF password.
 
-    Existing contract:
-    - If account ID contains at least four characters, use the last four.
-    - Otherwise use the last four available characters.
-    - Uppercase the password.
-
-    Example:
-        ACC-123456 -> 3456
+    The default password is ``F5E8``.  It can be overridden with
+    ``SAR_PDF_PASSWORD`` without changing the report-generation API.
     """
 
-    normalized = str(account_id).strip()
+    configured = os.environ.get("SAR_PDF_PASSWORD", "F5E8").strip()
+    if configured:
+        return configured
 
-    if not normalized:
-        return "CASE"
-
-    if len(normalized) >= 4:
-        return normalized[-4:].upper()
-
-    return normalized.upper()
+    # Safety fallback if an empty environment override is supplied.
+    return "F5E8"
 
 
 def _normalise_sar_json(result: Any) -> dict[str, str]:
@@ -306,6 +299,161 @@ def _normalise_sar_json(result: Any) -> dict[str, str]:
             default="Not available from the investigation evidence.",
         )
         for key in SAR_JSON_KEYS
+    }
+
+
+def _compact_dossier_for_sar(
+    dossier: dict[str, Any],
+) -> dict[str, Any]:
+    """Reduce a full investigation dossier to SAR-level facts.
+
+    This is a hard LLM boundary: raw transaction records, network edges,
+    security rows, and audit-event rows are never serialized into the SAR
+    prompt.  Existing hypothesis/regulatory/auditor/NBA objects are retained
+    because the SAR must summarize their conclusions.
+    """
+    if not isinstance(dossier, dict):
+        raise TypeError("dossier must be a dictionary.")
+
+    evidence = dossier.get("evidence") or {}
+    account = dossier.get("account") or evidence.get("account") or {}
+    alerts = evidence.get("alerts") or dossier.get("alerts") or []
+    transactions = evidence.get("transactions") or dossier.get("transactions") or []
+    network = evidence.get("network") or dossier.get("network") or {}
+    stats = network.get("stats") if isinstance(network, dict) else {}
+    stats = stats if isinstance(stats, dict) else {}
+
+    inbound = sum(
+        float(item.get("amount") or 0)
+        for item in transactions
+        if isinstance(item, dict) and item.get("direction") == "IN"
+    )
+    outbound = sum(
+        float(item.get("amount") or 0)
+        for item in transactions
+        if isinstance(item, dict) and item.get("direction") == "OUT"
+    )
+
+    regulatory = dossier.get("regulatory") or dossier.get("regulatory_findings") or {}
+    if not isinstance(regulatory, dict):
+        regulatory = {}
+
+    findings = regulatory.get("findings") or regulatory.get("broken_rules") or []
+    broken_rules = [
+        {
+            "rule_id": item.get("rule_id"),
+            "title": item.get("title"),
+            "severity": item.get("severity"),
+            "detail": _fit_text(item.get("detail"), 360),
+            "citation": _fit_text(item.get("citation"), 240),
+        }
+        for item in findings
+        if isinstance(item, dict) and item.get("applies", True)
+    ]
+
+    agents = dossier.get("hypotheses") or dossier.get("agents") or {}
+    if not isinstance(agents, dict):
+        agents = {}
+
+    auditor = dossier.get("auditor") or {}
+    nba = dossier.get("next_best_action") or {}
+    trail = dossier.get("audit_trail") or []
+
+    return {
+        "case_id": _extract_case_id(dossier),
+        "account_id": _extract_account_id(dossier),
+        "typology": _first_present(
+            dossier,
+            "typology",
+            "primary_trigger",
+            default="Not classified",
+        ),
+        "status": _first_present(
+            dossier,
+            "status",
+            "case_status",
+            default="Investigation report",
+        ),
+        "case": dossier.get("case") or {},
+        "account": {
+            key: account.get(key)
+            for key in (
+                "account_id",
+                "account_type",
+                "account_status",
+                "kyc_status",
+                "risk_rating",
+                "registered_country",
+                "customer_segment",
+            )
+            if key in account
+        },
+        "alert_summary": {
+            "count": len(alerts),
+            "total_score": round(
+                sum(float(item.get("score") or 0)
+                    for item in alerts if isinstance(item, dict)),
+                2,
+            ),
+            "typologies": sorted({
+                str(item.get("typology"))
+                for item in alerts
+                if isinstance(item, dict) and item.get("typology")
+            }),
+            "detection_rules": sorted({
+                str(item.get("rule_id"))
+                for item in alerts
+                if isinstance(item, dict) and item.get("rule_id")
+            }),
+        },
+        "activity_summary": {
+            "transaction_count": len(transactions),
+            "inbound_total": round(inbound, 2),
+            "outbound_total": round(outbound, 2),
+            "net_flow": round(inbound - outbound, 2),
+            "network_nodes": stats.get("nodes", 0),
+            "network_edges": stats.get("edges", 0),
+            "max_reached_depth": stats.get("max_reached_depth", 0),
+            "device_count": len(evidence.get("devices") or []),
+            "geo_event_count": len(evidence.get("geo_events") or []),
+            "beneficiary_count": len(evidence.get("beneficiaries") or []),
+        },
+        "hypotheses": {
+            "scammer": agents.get("scammer")
+                or agents.get("scammer_hypothesis")
+                or {},
+            "legitimate": agents.get("legitimate")
+                or agents.get("legitimate_hypothesis")
+                or {},
+            "contradiction": agents.get("contradiction") or {},
+        },
+        "regulatory": {
+            "str_required": regulatory.get("str_required", False),
+            "max_severity": regulatory.get("max_severity", "INFO"),
+            "broken_rules": broken_rules,
+        },
+        "auditor": {
+            "score": auditor.get("score"),
+            "threshold": auditor.get("threshold"),
+            "routing": auditor.get("routing"),
+            "missing": list(auditor.get("missing") or [])[:8],
+            "escalation_to_senior": auditor.get(
+                "escalation_to_senior",
+                False,
+            ),
+        },
+        "next_best_action": {
+            "action": nba.get("action"),
+            "reason": nba.get("reason"),
+        },
+        "audit_summary": {
+            "event_count": len(trail),
+            "event_types": sorted({
+                str(item.get("event_type"))
+                for item in trail
+                if isinstance(item, dict) and item.get("event_type")
+            }),
+        },
     }
 
 
@@ -1309,48 +1457,84 @@ def _render_audit_trail(
 # PDF generation
 # ---------------------------------------------------------------------------
 
+def _fit_text(text: Any, limit: int = 2200) -> str:
+    """Keep each LLM narrative bounded so the final report stays concise."""
+    value = _safe_text(text, "Not available from the investigation evidence.")
+    if len(value) <= limit:
+        return value
+    return value[: limit - 32].rstrip() + "\n[summary truncated]"
+
+
+def _compact_broken_rules(
+    regulatory: Any,
+) -> list[dict[str, str]]:
+    """Return only regulatory rules that actually applied."""
+    if not isinstance(regulatory, dict):
+        return []
+
+    findings = regulatory.get("broken_rules")
+    if findings is None:
+        findings = [
+            item
+            for item in regulatory.get("findings", [])
+            if isinstance(item, dict) and item.get("applies")
+        ]
+
+    result = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        result.append({
+            "rule_id": _safe_text(finding.get("rule_id"), "-"),
+            "title": _safe_text(finding.get("title"), "-"),
+            "severity": _safe_text(finding.get("severity"), "INFO"),
+            "detail": _fit_text(finding.get("detail"), 360),
+            "citation": _fit_text(finding.get("citation"), 240),
+        })
+    return result
+
+
 def _build_pdf(
     dossier: dict[str, Any],
     sar: dict[str, str],
 ) -> bytes:
-    """Build the decorative SAR PDF in memory."""
+    """Build a compact investigation-summary SAR PDF.
 
+    The PDF deliberately excludes raw evidence, transaction rows, network
+    edges, full agent JSON, and audit-event tables.  Those remain available in
+    backend storage.  The PDF contains the Gemini-generated case summary plus
+    compact deterministic findings and is bounded to five pages.
+    """
     metadata = _extract_metadata(dossier)
-    sections = _extract_analysis_sections(dossier)
     styles = _build_styles()
 
-    buffer = io.BytesIO()
+    regulatory = dossier.get("regulatory", {})
+    auditor = dossier.get("auditor", {})
+    nba = dossier.get("next_best_action", {})
+    hypotheses = dossier.get("hypotheses", {})
+    activity = dossier.get("activity_summary", {})
+    alert_summary = dossier.get("alert_summary", {})
 
+    buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
         pagesize=A4,
-        rightMargin=19 * mm,
-        leftMargin=19 * mm,
-        topMargin=21 * mm,
-        bottomMargin=19 * mm,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=17 * mm,
         title=f"SAR Report - {metadata['case_id']}",
-        author="Tekmerion Intelligence",
+        author="Financial Crime Investigation System",
         subject="Financial Crime Suspicious Activity Report",
     )
 
     story: list[Any] = []
 
-    # -----------------------------------------------------------------------
-    # Cover / identification
-    # -----------------------------------------------------------------------
-
-    story.append(Spacer(1, 5 * mm))
-
+    story.append(Spacer(1, 3 * mm))
+    story.append(Paragraph("SUSPICIOUS ACTIVITY REPORT", styles["title"]))
     story.append(
         Paragraph(
-            "SUSPICIOUS ACTIVITY REPORT",
-            styles["title"],
-        )
-    )
-
-    story.append(
-        Paragraph(
-            "TEKMERION INTELLIGENCE • FINANCIAL CRIME INVESTIGATION",
+            "CONFIDENTIAL • INVESTIGATION SUMMARY",
             styles["subtitle"],
         )
     )
@@ -1363,310 +1547,145 @@ def _build_pdf(
         ("Generated", metadata["generated_at"]),
         ("Confidentiality", "CONFIDENTIAL"),
     ]
-
-    story.append(
-        _info_table(
-            identification_rows,
-            styles,
-        )
-    )
-
-    story.append(Spacer(1, 7 * mm))
+    story.append(_info_table(identification_rows, styles))
+    story.append(Spacer(1, 4 * mm))
 
     story.append(
         _callout(
             "Document Security",
             (
-                "This report contains investigation information and is "
-                "password protected. Access is restricted to authorized "
-                "investigators and compliance personnel."
+                "This report is password protected and intended only for "
+                "authorized investigation, compliance, legal, audit, or "
+                "regulatory review."
             ),
             styles,
         )
     )
 
     # -----------------------------------------------------------------------
-    # Executive summary
+    # LLM narrative: concise, case-level synthesis.
     # -----------------------------------------------------------------------
-
-    story.extend(
-        _section_heading(
-            "1. Executive Summary",
-            styles,
-        )
+    narrative_sections = (
+        ("1. Executive Summary", "executive_summary"),
+        ("2. Suspicious Activity Narrative", "suspicious_activity_narrative"),
+        ("3. Subject Analysis", "subject_analysis"),
+        ("4. Assessment & Conclusion", "assessment_conclusion"),
     )
 
-    story.append(
-        Paragraph(
-            sar["executive_summary"].replace("\n", "<br/>"),
-            styles["body"],
+    for heading, key in narrative_sections:
+        story.extend(_section_heading(heading, styles))
+        story.append(
+            Paragraph(
+                _fit_text(sar.get(key)),
+                styles["body"],
+            )
         )
+
+    # -----------------------------------------------------------------------
+    # Deterministic investigation summary.
+    # -----------------------------------------------------------------------
+    story.extend(_section_heading("5. Investigation Summary", styles))
+
+    verdict = (
+        hypotheses.get("contradiction", {})
+        if isinstance(hypotheses, dict)
+        else {}
     )
+    if not isinstance(verdict, dict):
+        verdict = {}
 
-    # -----------------------------------------------------------------------
-    # Suspicious activity narrative
-    # -----------------------------------------------------------------------
+    summary_rows = [
+        ("Final verdict", _safe_text(verdict.get("verdict"), "Not available")),
+        ("Verdict confidence", _safe_text(verdict.get("confidence"), "Not available")),
+        ("Alert count", _safe_text(alert_summary.get("count"), "0")),
+        ("Alert score", _safe_text(alert_summary.get("total_score"), "0")),
+        ("Transactions reviewed", _safe_text(activity.get("transaction_count"), "0")),
+        ("Network", (
+            f"{_safe_text(activity.get('network_nodes'), '0')} nodes / "
+            f"{_safe_text(activity.get('network_edges'), '0')} edges / "
+            f"depth {_safe_text(activity.get('max_reached_depth'), '0')}"
+        )),
+        ("Completeness", _safe_text(auditor.get("score"), "Not available")),
+        ("Routing", _safe_text(auditor.get("routing"), "Not available")),
+        ("STR required", _safe_text(regulatory.get("str_required"), "False")),
+        ("Next best action", _safe_text(nba.get("action"), "Not available")),
+    ]
+    story.append(_info_table(summary_rows, styles))
 
-    story.extend(
-        _section_heading(
-            "2. Suspicious Activity Narrative",
-            styles,
+    broken_rules = _compact_broken_rules(regulatory)
+    if broken_rules:
+        story.extend(_section_heading("Regulatory Rules Triggered", styles))
+        rows = [[
+            Paragraph("Rule", styles["label"]),
+            Paragraph("Severity", styles["label"]),
+            Paragraph("Finding", styles["label"]),
+        ]]
+        for rule in broken_rules:
+            rows.append([
+                Paragraph(
+                    f"<b>{rule['rule_id']}</b><br/>{rule['title']}",
+                    styles["small"],
+                ),
+                Paragraph(rule["severity"], styles["small"]),
+                Paragraph(
+                    f"{rule['detail']}<br/><i>{rule['citation']}</i>",
+                    styles["small"],
+                ),
+            ])
+        table = Table(
+            rows,
+            colWidths=[45 * mm, 24 * mm, 101 * mm],
+            repeatRows=1,
         )
-    )
-
-    story.append(
-        Paragraph(
-            sar["suspicious_activity_narrative"].replace(
-                "\n",
-                "<br/>",
-            ),
-            styles["body"],
+        table.setStyle(
+            TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E9EEF5")),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#D2D9E3")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 2 * mm),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 2 * mm),
+                ("TOPPADDING", (0, 0), (-1, -1), 1.5 * mm),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5 * mm),
+            ])
         )
-    )
+        story.append(table)
 
-    # -----------------------------------------------------------------------
-    # Subject analysis
-    # -----------------------------------------------------------------------
-
-    story.extend(
-        _section_heading(
-            "3. Subject Analysis",
-            styles,
-        )
-    )
-
-    story.append(
-        Paragraph(
-            sar["subject_analysis"].replace("\n", "<br/>"),
-            styles["body"],
-        )
-    )
-
-    # -----------------------------------------------------------------------
-    # Evidence overview
-    # -----------------------------------------------------------------------
-
-    evidence = sections["evidence"]
-
-    if evidence:
-        story.extend(
-            _section_heading(
-                "4. Investigation Evidence",
+    missing = auditor.get("missing") if isinstance(auditor, dict) else []
+    if missing:
+        story.append(
+            _callout(
+                "Evidence Limitations",
+                "<br/>".join(
+                    f"• {_fit_text(item, 220)}"
+                    for item in missing[:8]
+                ),
                 styles,
             )
         )
 
-        if isinstance(evidence, dict):
-            for key, value in evidence.items():
-                if value in (None, "", [], {}):
-                    continue
-
-                if isinstance(value, list):
-                    story.extend(
-                        _bullet_section(
-                            str(key).replace("_", " ").title(),
-                            value,
-                            styles,
-                        )
-                    )
-                elif isinstance(value, dict):
-                    story.append(
-                        Paragraph(
-                            str(key).replace("_", " ").title(),
-                            styles["subsection"],
-                        )
-                    )
-
-                    story.append(
-                        Paragraph(
-                            _safe_text(value).replace(
-                                "\n",
-                                "<br/>",
-                            ),
-                            styles["body"],
-                        )
-                    )
-                else:
-                    story.append(
-                        Paragraph(
-                            f"<b>{str(key).replace('_', ' ').title()}</b>: "
-                            f"{_safe_text(value)}",
-                            styles["body"],
-                        )
-                    )
-        else:
-            story.append(
-                Paragraph(
-                    _safe_text(evidence),
-                    styles["body"],
-                )
-            )
-
-    # -----------------------------------------------------------------------
-    # Network evidence
-    # -----------------------------------------------------------------------
-
-    network = sections["network"]
-
-    if network:
-        story.extend(
-            _section_heading(
-                "5. Network / Transaction Analysis",
-                styles,
-            )
-        )
-
-        if isinstance(network, dict):
-            for key, value in network.items():
-                if value in (None, "", [], {}):
-                    continue
-
-                title = str(key).replace("_", " ").title()
-
-                if isinstance(value, list):
-                    story.extend(
-                        _bullet_section(
-                            title,
-                            value,
-                            styles,
-                        )
-                    )
-                else:
-                    story.append(
-                        Paragraph(
-                            f"<b>{title}</b>",
-                            styles["subsection"],
-                        )
-                    )
-                    story.append(
-                        Paragraph(
-                            _safe_text(value).replace(
-                                "\n",
-                                "<br/>",
-                            ),
-                            styles["body"],
-                        )
-                    )
-        else:
-            story.append(
-                Paragraph(
-                    _safe_text(network),
-                    styles["body"],
-                )
-            )
-
-    # -----------------------------------------------------------------------
-    # Hypothesis analysis
-    # -----------------------------------------------------------------------
-
-    story.extend(
-        _render_hypotheses(
-            sections["hypotheses"],
-            styles,
-        )
-    )
-
-    # -----------------------------------------------------------------------
-    # Regulatory assessment
-    # -----------------------------------------------------------------------
-
-    story.extend(
-        _render_regulatory(
-            sections["regulatory"],
-            sections["rag"],
-            styles,
-        )
-    )
-
-    # -----------------------------------------------------------------------
-    # Auditor
-    # -----------------------------------------------------------------------
-
-    story.extend(
-        _render_auditor(
-            sections["auditor"],
-            styles,
-        )
-    )
-
-    # -----------------------------------------------------------------------
-    # Next-best-action
-    # -----------------------------------------------------------------------
-
-    story.extend(
-        _render_nba(
-            sections["next_best_action"],
-            styles,
-        )
-    )
-
-    # -----------------------------------------------------------------------
-    # Assessment / conclusion
-    # -----------------------------------------------------------------------
-
-    story.extend(
-        _section_heading(
-            "Assessment & Conclusion",
-            styles,
-        )
-    )
-
-    story.append(
-        Paragraph(
-            sar["assessment_conclusion"].replace(
-                "\n",
-                "<br/>",
-            ),
-            styles["body"],
-        )
-    )
-
-    # -----------------------------------------------------------------------
-    # Final disposition
-    # -----------------------------------------------------------------------
-
-    disposition = sections["disposition"]
-
-    story.extend(
-        _section_heading(
-            "Final Disposition",
-            styles,
-        )
-    )
-
+    story.append(Spacer(1, 4 * mm))
     story.append(
         _callout(
-            "Investigation Disposition",
-            _safe_text(disposition),
-            styles,
-        )
-    )
-
-    # -----------------------------------------------------------------------
-    # Audit trail
-    # -----------------------------------------------------------------------
-
-    story.extend(
-        _render_audit_trail(
-            sections["audit_trail"],
-            styles,
-        )
-    )
-
-    # -----------------------------------------------------------------------
-    # Closing notice
-    # -----------------------------------------------------------------------
-
-    story.append(Spacer(1, 7 * mm))
-
-    story.append(
-        _callout(
-            "Confidentiality Notice",
+            "Recommended Disposition",
             (
-                "This document is intended solely for authorized financial "
-                "crime investigation, compliance, legal, audit, or regulatory "
-                "review. Unauthorized disclosure, modification, or "
-                "distribution is prohibited."
+                f"<b>{_safe_text(nba.get('action'), 'Not available')}</b>"
+                f"<br/>{_fit_text(nba.get('reason'), 520)}"
+            ),
+            styles,
+        )
+    )
+
+    story.append(Spacer(1, 5 * mm))
+    story.append(
+        _callout(
+            "Source Boundary",
+            (
+                "This document is an investigation summary generated from "
+                "the case evidence, independent hypothesis outputs, "
+                "contradiction resolution, deterministic regulatory findings, "
+                "investigation audit, and next-best-action. Raw evidence and "
+                "full agent JSON are retained separately and are not embedded "
+                "in this PDF."
             ),
             styles,
         )
@@ -1678,7 +1697,105 @@ def _build_pdf(
         onLaterPages=_draw_page,
     )
 
-    return buffer.getvalue()
+    pdf = buffer.getvalue()
+
+    # The bounded narrative and compact tables are designed for <=5 pages.
+    # If an unusually verbose provider response still overflows, rebuild with
+    # progressively tighter narrative limits.  No raw evidence is introduced
+    # as a fallback.
+    for limit in (1600, 1100, 750):
+        reader = PdfReader(io.BytesIO(pdf))
+        if len(reader.pages) <= 5:
+            return pdf
+
+        compact_sar = {
+            key: _fit_text(sar.get(key), limit)
+            for key in SAR_JSON_KEYS
+        }
+
+        retry_buffer = io.BytesIO()
+        retry_doc = SimpleDocTemplate(
+            retry_buffer,
+            pagesize=A4,
+            rightMargin=18 * mm,
+            leftMargin=18 * mm,
+            topMargin=18 * mm,
+            bottomMargin=17 * mm,
+            title=f"SAR Report - {metadata['case_id']}",
+            author="Financial Crime Investigation System",
+            subject="Financial Crime Suspicious Activity Report",
+        )
+
+        # Reuse the same compact structure without duplicating evidence.
+        retry_story: list[Any] = [
+            Spacer(1, 3 * mm),
+            Paragraph("SUSPICIOUS ACTIVITY REPORT", styles["title"]),
+            Paragraph(
+                "CONFIDENTIAL • INVESTIGATION SUMMARY",
+                styles["subtitle"],
+            ),
+            _info_table(identification_rows, styles),
+            Spacer(1, 4 * mm),
+            _callout(
+                "Document Security",
+                "This report is password protected and restricted to authorized review.",
+                styles,
+            ),
+        ]
+
+        for heading, key in narrative_sections:
+            retry_story.extend(_section_heading(heading, styles))
+            retry_story.append(
+                Paragraph(compact_sar[key], styles["body"])
+            )
+
+        retry_story.extend(_section_heading("5. Investigation Summary", styles))
+        retry_story.append(_info_table(summary_rows, styles))
+
+        if broken_rules:
+            retry_story.extend(_section_heading("Regulatory Rules Triggered", styles))
+            for rule in broken_rules:
+                retry_story.append(
+                    Paragraph(
+                        f"<b>{rule['rule_id']} — {rule['title']}</b> "
+                        f"({rule['severity']}): {rule['detail']}",
+                        styles["small"],
+                    )
+                )
+
+        if missing:
+            retry_story.append(
+                _callout(
+                    "Evidence Limitations",
+                    "<br/>".join(
+                        f"• {_fit_text(item, 180)}"
+                        for item in missing[:6]
+                    ),
+                    styles,
+                )
+            )
+
+        retry_story.append(
+            _callout(
+                "Recommended Disposition",
+                (
+                    f"<b>{_safe_text(nba.get('action'), 'Not available')}</b>"
+                    f"<br/>{_fit_text(nba.get('reason'), 420)}"
+                ),
+                styles,
+            )
+        )
+        retry_doc.build(
+            retry_story,
+            onFirstPage=_draw_page,
+            onLaterPages=_draw_page,
+        )
+        pdf = retry_buffer.getvalue()
+
+    if len(PdfReader(io.BytesIO(pdf)).pages) > 5:
+        raise ValueError("SAR report could not be constrained to five pages.")
+
+    return pdf
 
 
 # ---------------------------------------------------------------------------
@@ -1797,12 +1914,16 @@ def generate(
     case_id = metadata["case_id"]
     account_id = metadata["account_id"]
 
+    # Enforce the compact SAR boundary even when a caller supplies the full
+    # investigation dossier.
+    sar_dossier = _compact_dossier_for_sar(dossier)
+
     # -----------------------------------------------------------------------
     # 1. Generate SAR narrative through Gemini.
     # -----------------------------------------------------------------------
 
     sar = sar_summary(
-        dossier,
+        sar_dossier,
         client=client,
     )
 
@@ -1811,7 +1932,7 @@ def generate(
     # -----------------------------------------------------------------------
 
     pdf_bytes = _build_pdf(
-        dossier,
+        sar_dossier,
         sar,
     )
 

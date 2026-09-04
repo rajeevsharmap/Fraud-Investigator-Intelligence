@@ -56,6 +56,7 @@ The frontend API contract is intentionally unchanged.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import os
@@ -69,7 +70,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 
 from agents.gemini_client import GeminiClient
-from agents.hypothesis_agents import run_all as run_agents
+from agents.hypothesis_agents import HypothesisAgents
 
 from audit.auditor import audit as run_auditor
 from audit.next_best_action import next_best_action
@@ -467,93 +468,70 @@ def _load_json(
 # ============================================================================
 
 @app.post("/cases/{case_id}/investigate")
-def start_investigation(
+async def start_investigation(
     case_id: str,
     x_investigator_role: str | None = Header(default=None),
 ):
-    """Start investigation.
+    """Build sanitized evidence and run the two initial hypotheses in parallel.
 
-    Flow:
+    Workflow boundary:
+        EvidenceBuilder -> PII Sanitizer -> {Scammer, Legitimate} (parallel)
 
-        Case
-          -> EvidenceBuilder
-          -> PIISanitizer
-          -> Gemini Hypothesis Agents
-          -> Persist masked agent output
-          -> Audit event
+    The contradiction agent is deliberately NOT executed here. It is gated
+    behind ``POST /cases/{case_id}/resolve-contradiction`` so the investigator
+    can review both independent hypotheses before resolving the contradiction.
 
-    Gemini receives ONLY the sanitized evidence package.
+    The JSON returned by each hypothesis agent is preserved exactly; this
+    endpoint only wraps those two unchanged agent objects under ``agents``.
     """
+    role = _require_role(x_investigator_role)
 
-    role = _require_role(
-        x_investigator_role,
-    )
+    case, alerts = _case_with_alerts(case_id, role)
 
-    case, alerts = _case_with_alerts(
-        case_id,
-        role,
-    )
+    evidence_dir = os.path.join(MOCKDATA_DIR, "evidence")
+    builder = EvidenceBuilder(app.state.data, evidence_dir)
 
-    evidence_dir = os.path.join(
-        MOCKDATA_DIR,
-        "evidence",
-    )
-
-    builder = EvidenceBuilder(
-        app.state.data,
-        evidence_dir,
-    )
-
-    raw = builder.build(
-        case,
-        alerts,
-    )
+    raw = builder.build(case, alerts)
 
     sanitizer = PIISanitizer()
+    safe = sanitizer.mask_package(raw, role)
 
-    safe = sanitizer.mask_package(
-        raw,
-        role,
-    )
+    builder.save(safe)
 
-    # Persist only the LLM-safe evidence package.
-    builder.save(
-        safe,
-    )
-
-    # Persist the backend-only alias mapping.
     alias_path = os.path.join(
         evidence_dir,
         f"{case_id}_aliases.json",
     )
+    sanitizer.save_aliases(alias_path)
 
-    sanitizer.save_aliases(
-        alias_path,
+    # Run the independent hypothesis agents concurrently.  Separate client
+    # instances keep the provider boundary isolated per worker while the
+    # evidence package remains identical for both agents.
+    async def _run_scammer():
+        return await asyncio.to_thread(
+            HypothesisAgents(client=GeminiClient()).scammer,
+            safe,
+        )
+
+    async def _run_legitimate():
+        return await asyncio.to_thread(
+            HypothesisAgents(client=GeminiClient()).legitimate,
+            safe,
+        )
+
+    scammer_result, legitimate_result = await asyncio.gather(
+        _run_scammer(),
+        _run_legitimate(),
     )
 
-    # ------------------------------------------------------------------------
-    # Gemini migration:
-    #
-    # Previously:
-    #     run_agents(safe, GrokClient())
-    #
-    # Now:
-    #     run_agents(safe, GeminiClient())
-    #
-    # No JSON contract change.
-    # ------------------------------------------------------------------------
-
-    agents_out = run_agents(
-        safe,
-        _gemini_client(),
-    )
+    agents_out = {
+        "scammer": scammer_result,
+        "legitimate": legitimate_result,
+    }
 
     _save_json(
         agents_out,
-        _evidence_path(
-            case_id,
-            "_agents",
-        ),
+        _evidence_path(case_id, "_agents"),
     )
 
     record_event(
@@ -561,14 +539,106 @@ def start_investigation(
         case_id,
         role,
         "HYPOTHESIS_AGENTS_RUN",
-        (
-            "verdict="
-            f"{agents_out.get('contradiction', {}).get('verdict')}"
-        ),
+        "scammer and legitimate hypotheses completed in parallel",
     )
 
     return {
         "llm_safe_evidence": safe,
+        "agents": agents_out,
+    }
+
+
+@app.post("/cases/{case_id}/resolve-contradiction")
+async def resolve_contradiction(
+    case_id: str,
+    x_investigator_role: str | None = Header(default=None),
+):
+    """Run the contradiction agent after both independent hypotheses exist.
+
+    The contradiction agent receives:
+      - the unchanged scammer hypothesis JSON,
+      - the unchanged legitimate hypothesis JSON,
+      - the sanitized evidence-builder package.
+
+    Its existing JSON contract is returned unchanged under ``agents``.
+    """
+    role = _require_role(x_investigator_role)
+    case, _ = _case_with_alerts(case_id, role)
+
+    evidence_path = _evidence_path(case_id, "")
+    agents_path = _evidence_path(case_id, "_agents")
+
+    if not os.path.exists(evidence_path):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "no evidence package yet - "
+                "POST /cases/{case_id}/investigate first"
+            ),
+        )
+
+    if not os.path.exists(agents_path):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "hypothesis results not found - "
+                "POST /cases/{case_id}/investigate first"
+            ),
+        )
+
+    evidence = _load_json(evidence_path)
+    initial_agents = _load_json(agents_path)
+
+    scammer_result = initial_agents.get("scammer")
+    legitimate_result = initial_agents.get("legitimate")
+
+    # Read legacy key names only for compatibility with older persisted
+    # analysis files; the response contract of the agents themselves is never
+    # renamed or rewritten.
+    if scammer_result is None:
+        scammer_result = initial_agents.get("scammer_hypothesis")
+    if legitimate_result is None:
+        legitimate_result = initial_agents.get("legitimate_hypothesis")
+
+    if not isinstance(scammer_result, dict) or not isinstance(
+        legitimate_result, dict
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "both scammer and legitimate hypotheses are required "
+                "before contradiction resolution"
+            ),
+        )
+
+    contradiction = await asyncio.to_thread(
+        HypothesisAgents(client=GeminiClient()).contradiction,
+        scammer_result,
+        legitimate_result,
+        evidence,
+    )
+
+    agents_out = {
+        "scammer": scammer_result,
+        "legitimate": legitimate_result,
+        "contradiction": contradiction,
+    }
+
+    _save_json(
+        agents_out,
+        agents_path,
+    )
+
+    record_event(
+        MOCKDATA_DIR,
+        case_id,
+        role,
+        "CONTRADICTION_AGENT_RUN",
+        f"verdict={contradiction.get('verdict')}",
+    )
+
+    return {
+        "case_id": case["case_id"],
         "agents": agents_out,
     }
 
@@ -675,6 +745,21 @@ def _full_analysis(
         "auditor": auditor,
     }
 
+    # Compact regulatory projection for the frontend.  The authoritative
+    # regulatory engine response remains unchanged; this convenience field
+    # exposes only rules that actually applied.
+    analysis["broken_rules"] = [
+        {
+            "rule_id": finding.get("rule_id"),
+            "title": finding.get("title"),
+            "severity": finding.get("severity"),
+            "detail": finding.get("detail"),
+            "citation": finding.get("citation"),
+        }
+        for finding in regulatory.get("findings", [])
+        if finding.get("applies")
+    ]
+
     # ------------------------------------------------------------------------
     # 4. Next Best Action
     # ------------------------------------------------------------------------
@@ -727,20 +812,24 @@ def run_analysis(
         "_agents",
     )
 
-    if os.path.exists(agents_path):
-        agents_out = _load_json(
-            agents_path,
-        )
-    else:
-        # Gemini replaces Grok here as well.
-        agents_out = run_agents(
-            evidence,
-            _gemini_client(),
+    if not os.path.exists(agents_path):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "hypothesis results not found - run "
+                "POST /cases/{case_id}/investigate first"
+            ),
         )
 
-        _save_json(
-            agents_out,
-            agents_path,
+    agents_out = _load_json(agents_path)
+
+    if not isinstance(agents_out.get("contradiction"), dict):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "contradiction resolution is required before analysis - "
+                "POST /cases/{case_id}/resolve-contradiction first"
+            ),
         )
 
     analysis = _full_analysis(
@@ -1037,6 +1126,147 @@ def _update_case_status(
 # SAR REPORT
 # ============================================================================
 
+
+def _build_sar_dossier(
+    case: dict,
+    evidence: dict,
+    analysis: dict,
+    trail: list,
+) -> dict:
+    """Build a compact investigation summary for the SAR narrative agent.
+
+    Raw transactions, network edges, security rows, and the full audit trail
+    remain in their persisted backend records.  The SAR LLM receives only
+    aggregate investigation facts plus the already-produced agent/regulatory
+    conclusions, so the PDF summarizes the investigation instead of printing
+    the evidence package verbatim.
+    """
+    transactions = evidence.get("transactions") or []
+    network = evidence.get("network") or {}
+    stats = network.get("stats") if isinstance(network, dict) else {}
+    stats = stats if isinstance(stats, dict) else {}
+
+    inbound = sum(
+        float(t.get("amount") or 0)
+        for t in transactions
+        if t.get("direction") == "IN"
+    )
+    outbound = sum(
+        float(t.get("amount") or 0)
+        for t in transactions
+        if t.get("direction") == "OUT"
+    )
+
+    alerts = evidence.get("alerts") or []
+    alert_summary = {
+        "count": len(alerts),
+        "total_score": round(
+            sum(float(a.get("score") or 0) for a in alerts), 2
+        ),
+        "typologies": sorted({
+            str(a.get("typology"))
+            for a in alerts
+            if a.get("typology")
+        }),
+        "detection_rules": sorted({
+            str(a.get("rule_id"))
+            for a in alerts
+            if a.get("rule_id")
+        }),
+    }
+
+    account = evidence.get("account") or {}
+    agents = analysis.get("agents") or {}
+    regulatory = analysis.get("regulatory") or {}
+    auditor = analysis.get("auditor") or {}
+    nba = analysis.get("next_best_action") or {}
+
+    applied_rules = [
+        {
+            "rule_id": finding.get("rule_id"),
+            "title": finding.get("title"),
+            "severity": finding.get("severity"),
+            "detail": finding.get("detail"),
+            "citation": finding.get("citation"),
+        }
+        for finding in regulatory.get("findings", [])
+        if finding.get("applies")
+    ]
+
+    return {
+        "case": {
+            "case_id": case.get("case_id", ""),
+            "primary_trigger": case.get("primary_trigger", ""),
+            "typologies": case.get("typologies", ""),
+            "status": case.get("status", ""),
+            "created_at": case.get("created_at", ""),
+        },
+        "account": {
+            "account_id": account.get(
+                "account_id",
+                case.get("account_id", "UNKNOWN"),
+            ),
+            "account_type": account.get("account_type"),
+            "account_status": account.get("account_status"),
+            "kyc_status": account.get("kyc_status"),
+            "risk_rating": account.get("risk_rating"),
+            "registered_country": account.get("registered_country"),
+            "customer_segment": account.get("customer_segment"),
+        },
+        "alert_summary": alert_summary,
+        "activity_summary": {
+            "transaction_count": len(transactions),
+            "inbound_total": round(inbound, 2),
+            "outbound_total": round(outbound, 2),
+            "net_flow": round(inbound - outbound, 2),
+            "network_nodes": stats.get("nodes", 0),
+            "network_edges": stats.get("edges", 0),
+            "max_reached_depth": stats.get("max_reached_depth", 0),
+            "device_count": len(evidence.get("devices") or []),
+            "geo_event_count": len(evidence.get("geo_events") or []),
+            "beneficiary_count": len(evidence.get("beneficiaries") or []),
+        },
+        # Preserve the actual hypothesis-agent JSON objects.  This is a
+        # summary boundary for SAR only; the API response remains unchanged.
+        "hypotheses": {
+            "scammer": agents.get("scammer")
+                or agents.get("scammer_hypothesis")
+                or {},
+            "legitimate": agents.get("legitimate")
+                or agents.get("legitimate_hypothesis")
+                or {},
+            "contradiction": agents.get("contradiction") or {},
+        },
+        "regulatory": {
+            "str_required": regulatory.get("str_required", False),
+            "max_severity": regulatory.get("max_severity", "INFO"),
+            "broken_rules": applied_rules,
+        },
+        "auditor": {
+            "score": auditor.get("score"),
+            "threshold": auditor.get("threshold"),
+            "routing": auditor.get("routing"),
+            "missing": auditor.get("missing", []),
+            "escalation_to_senior": auditor.get(
+                "escalation_to_senior",
+                False,
+            ),
+        },
+        "next_best_action": {
+            "action": nba.get("action"),
+            "reason": nba.get("reason"),
+        },
+        "audit_summary": {
+            "event_count": len(trail or []),
+            "event_types": sorted({
+                str(event.get("event_type"))
+                for event in (trail or [])
+                if isinstance(event, dict) and event.get("event_type")
+            }),
+        },
+    }
+
+
 @app.post("/cases/{case_id}/sar-report")
 def sar_report(
     case_id: str,
@@ -1204,69 +1434,12 @@ def sar_report(
         case_id,
     )
 
-    dossier = {
-        "case_id": case.get(
-            "case_id",
-            case_id,
-        ),
-        "account_id": case.get(
-            "account_id",
-            "UNKNOWN",
-        ),
-        "typology": case.get(
-            "primary_trigger",
-            case.get(
-                "typologies",
-                "Not classified",
-            ),
-        ),
-        "primary_trigger": case.get(
-            "primary_trigger",
-            "",
-        ),
-        "typologies": case.get(
-            "typologies",
-            "",
-        ),
-        "status": case.get(
-            "status",
-            "",
-        ),
-        "case": case,
-        "evidence": evidence,
-        "network": evidence.get(
-            "network",
-            {},
-        ),
-        "hypotheses": analysis.get(
-            "agents",
-            {},
-        ),
-        "regulatory": analysis.get(
-            "regulatory",
-            {},
-        ),
-        "regulatory_rag": analysis.get(
-            "regulatory_rag",
-            {},
-        ),
-        "auditor": analysis.get(
-            "auditor",
-            {},
-        ),
-        "next_best_action": analysis.get(
-            "next_best_action",
-            {},
-        ),
-        "audit_trail": trail,
-        "disposition": analysis.get(
-            "next_best_action",
-            {},
-        ).get(
-            "action",
-            "Not available",
-        ),
-    }
+    dossier = _build_sar_dossier(
+        case,
+        evidence,
+        analysis,
+        trail,
+    )
 
     # ------------------------------------------------------------------------
     # Generate SAR through the new Gemini-compatible reports.sar API.
@@ -1312,9 +1485,7 @@ def sar_report(
         media_type="application/pdf",
         filename=f"SAR_{case_id}.pdf",
         headers={
-            "X-SAR-Password-Hint": (
-                "account holder's account id - last four characters"
-            ),
+            "X-SAR-Password-Hint": "Use the configured SAR password.",
         },
     )
 
