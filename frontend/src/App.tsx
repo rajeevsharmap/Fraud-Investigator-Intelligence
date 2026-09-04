@@ -134,7 +134,7 @@ function RoleScreen() {
       setValidationError("Please enter your password.");
       return;
     }
-    if (password !== "Argus@123") {
+    if (password !== "123456") {
       setValidationError("Invalid investigator credentials.");
       return;
     }
@@ -419,11 +419,11 @@ function CaseQueue({
   const cases =
     mode === "audit" && role === "JUNIOR"
       ? [
-          ...data,
-          ...reopenedCases.filter(
-            (item) => !seenIds.has(value(item, ["case_id"])),
-          ),
-        ]
+        ...data,
+        ...reopenedCases.filter(
+          (item) => !seenIds.has(value(item, ["case_id"])),
+        ),
+      ]
       : data;
   const filtered = cases
     .filter((item) => {
@@ -515,83 +515,83 @@ function CaseQueue({
       ) : (
         <>
           <div className="toolbar">
-        <div className="search-field">
-          <Search size={17} />
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search case records..."
-          />
-        </div>
-        <label className="select-label">
-          Filter by Risk{" "}
-          <select
-            value={riskFilter}
-            onChange={(event) => setRiskFilter(event.target.value)}
-          >
-            <option value="all">All</option>
-            <option value="low">Low</option>
-            <option value="medium">Medium</option>
-            <option value="high">High</option>
-          </select>
-        </label>
-        <label className="select-label">
-          Filter by Primary Trigger{" "}
-          <select
-            value={triggerFilter}
-            onChange={(event) => setTriggerFilter(event.target.value)}
-          >
-            <option value="all">All</option>
-            <option value="smurfing">smurfing</option>
-            <option value="reverse_smurfing">reverse_smurfing</option>
-            <option value="account_swap">account_swap</option>
-          </select>
-        </label>
-      </div>
-      {loading ? (
-        <LoadingState label="Loading authorized case queue" />
-      ) : error ? (
-        <ErrorState message={error} retry={reload} />
-      ) : filtered.length === 0 ? (
-        <EmptyState
-          title={
-            mode === "alerts"
-              ? "No authorized cases"
-              : `No ${mode} cases available`
-          }
-          detail="The backend returned no records matching this view. Nothing has been fabricated for this queue."
-        />
-      ) : (
-        <div className="case-table">
-          <div className="table-head">
-            <span>Case</span>
-            <span>Primary trigger</span>
-            <span>Evidence signals</span>
-            <span>Status</span>
-            <span />
+            <div className="search-field">
+              <Search size={17} />
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search case records..."
+              />
+            </div>
+            <label className="select-label">
+              Filter by Risk{" "}
+              <select
+                value={riskFilter}
+                onChange={(event) => setRiskFilter(event.target.value)}
+              >
+                <option value="all">All</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+              </select>
+            </label>
+            <label className="select-label">
+              Filter by Primary Trigger{" "}
+              <select
+                value={triggerFilter}
+                onChange={(event) => setTriggerFilter(event.target.value)}
+              >
+                <option value="all">All</option>
+                <option value="smurfing">smurfing</option>
+                <option value="reverse_smurfing">reverse_smurfing</option>
+                <option value="account_swap">account_swap</option>
+              </select>
+            </label>
           </div>
-          {filtered.map((item) => (
-            <Link
-              className="case-row"
-              to={`/cases/${encodeURIComponent(value(item, ["case_id"], ""))}`}
-              key={value(item, ["case_id"])}
-            >
-              <div>
-                <strong>{value(item, ["case_id"])}</strong>
-                <small>
-                  {value(item, ["account_id", "created_at", "detected_at"])}
-                </small>
+          {loading ? (
+            <LoadingState label="Loading authorized case queue" />
+          ) : error ? (
+            <ErrorState message={error} retry={reload} />
+          ) : filtered.length === 0 ? (
+            <EmptyState
+              title={
+                mode === "alerts"
+                  ? "No authorized cases"
+                  : `No ${mode} cases available`
+              }
+              detail="The backend returned no records matching this view. Nothing has been fabricated for this queue."
+            />
+          ) : (
+            <div className="case-table">
+              <div className="table-head">
+                <span>Case</span>
+                <span>Primary trigger</span>
+                <span>Evidence signals</span>
+                <span>Status</span>
+                <span />
               </div>
-              <span>
-                {value(item, ["primary_trigger", "reason", "alert_reason"])}
-              </span>
-              <span>{value(item, ["evidence_signals", "typologies"])}</span>
-              <StatusBadge status={value(item, ["status"])} />
-              <ChevronRight size={17} />
-            </Link>
-          ))}
-        </div>
-      )}
+              {filtered.map((item) => (
+                <Link
+                  className="case-row"
+                  to={`/cases/${encodeURIComponent(value(item, ["case_id"], ""))}`}
+                  key={value(item, ["case_id"])}
+                >
+                  <div>
+                    <strong>{value(item, ["case_id"])}</strong>
+                    <small>
+                      {value(item, ["account_id", "created_at", "detected_at"])}
+                    </small>
+                  </div>
+                  <span>
+                    {value(item, ["primary_trigger", "reason", "alert_reason"])}
+                  </span>
+                  <span>{value(item, ["evidence_signals", "typologies"])}</span>
+                  <StatusBadge status={value(item, ["status"])} />
+                  <ChevronRight size={17} />
+                </Link>
+              ))}
+            </div>
+          )}
         </>
       )}
     </section>
@@ -1260,32 +1260,32 @@ function Graph({ caseId }: { caseId: string }) {
     const runningLayout = graph.makeLayout(
       swap
         ? {
-            name: "concentric",
-            concentric: (node: cytoscape.NodeSingular) =>
-              node.data("is_case_account") === true
-                ? 2
-                : node.hasClass("swap-device") || node.hasClass("swap-geo")
-                  ? 0
-                  : 1,
-            levelWidth: () => 1,
-            minNodeSpacing: 26,
-            animate: true,
-            animationDuration: 700,
-            fit: true,
-            padding: 45,
-          }
+          name: "concentric",
+          concentric: (node: cytoscape.NodeSingular) =>
+            node.data("is_case_account") === true
+              ? 2
+              : node.hasClass("swap-device") || node.hasClass("swap-geo")
+                ? 0
+                : 1,
+          levelWidth: () => 1,
+          minNodeSpacing: 26,
+          animate: true,
+          animationDuration: 700,
+          fit: true,
+          padding: 45,
+        }
         : {
-            name: "cose",
-            animate: true,
-            animationDuration: 850,
-            animationEasing: "ease-out-cubic",
-            refresh: 30,
-            fit: true,
-            padding: 45,
-            nodeRepulsion: 450000,
-            idealEdgeLength: 105,
-            gravity: 0.35,
-          },
+          name: "cose",
+          animate: true,
+          animationDuration: 850,
+          animationEasing: "ease-out-cubic",
+          refresh: 30,
+          fit: true,
+          padding: 45,
+          nodeRepulsion: 450000,
+          idealEdgeLength: 105,
+          gravity: 0.35,
+        },
     );
     runningLayout.run();
     graphRef.current = graph;

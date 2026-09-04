@@ -1,0 +1,3 @@
+escalation_id,case_id,escalation_reason,completeness_score_at_escalation,primary_trigger,evidence_signals,escalated_at,escalated_by,status
+ESC-W3PUVMI,CASE-1YXQ2BP,ksjdbc,,smurfing,"SMF-005,SMF-006",2026-09-04 17:58:04,JUNIOR,OPEN
+ESC-7OCJSR3,CASE-VLO7LVL,gggdg,70,smurfing,"SMF-001,SMF-002,SMF-003,SMF-007,SMF-005,SMF-006,RSMF-004,RSMF-007,RSMF-006,RSMF-005",2026-09-04 18:17:31,JUNIOR,OPEN
