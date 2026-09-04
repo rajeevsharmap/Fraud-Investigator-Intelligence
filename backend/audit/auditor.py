@@ -43,9 +43,9 @@ def audit(case: dict, evidence: dict, agents: dict, regulatory: dict) -> dict:
     add("alerts_present", bool(evidence.get("alerts")))
     add("transactions", bool(evidence.get("transactions")))
     add("network_for_flow", not (flows & FLOW_TYPOLOGIES)
-        or bool(evidence.get("network", {}).get("stats", {}).get("edge_count")),
+        or bool(evidence.get("network", {}).get("stats", {}).get("edges", 0)),
         "network absent for fund-flow typology" if flows & FLOW_TYPOLOGIES
-        and not evidence.get("network", {}).get("stats", {}).get("edge_count") else "")
+        and not evidence.get("network", {}).get("stats", {}).get("edges", 0) else "")
     add("security_for_swap", "account_swap" not in flows
         or bool(evidence.get("security_timeline")))
     add("agents_output", bool(agents.get("scammer_hypothesis")
@@ -60,14 +60,14 @@ def audit(case: dict, evidence: dict, agents: dict, regulatory: dict) -> dict:
     if score < COMPLETE_THRESHOLD:
         routing = "MORE_EVIDENCE_REQUIRED"
     elif verdict == "insufficient_evidence" or (flows & FLOW_TYPOLOGIES
-            and not evidence.get("network", {}).get("stats", {}).get("edge_count")):
+            and not evidence.get("network", {}).get("stats", {}).get("edges", 0)):
         routing = "ESCALATION_REQUIRED"
     else:
         routing = "COMPLETE"
 
     restricted_needed = (
         evidence.get("role") == "JUNIOR"
-        and (routing != "COMPLETE" or regulatory.get("str_required")))
+        and routing != "COMPLETE")
     return {"score": score, "threshold": COMPLETE_THRESHOLD,
             "routing": routing, "checks": results, "missing": missing,
             "escalation_to_senior": restricted_needed,
