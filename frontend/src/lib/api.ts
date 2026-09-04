@@ -37,6 +37,7 @@ export const api = {
   investigate: (id: string) => request<InvestigationResponse>(`/cases/${encodeURIComponent(id)}/investigate`, { method: 'POST' }),
   getEvidence: (id: string) => request<DataRecord>(`/cases/${encodeURIComponent(id)}/evidence`),
   runAnalysis: (id: string) => request<DataRecord>(`/cases/${encodeURIComponent(id)}/analysis`, { method: 'POST' }),
+  getAnalysis: (id: string) => request<DataRecord>(`/cases/${encodeURIComponent(id)}/analysis`),
   getAudit: (id: string) => request<AuditResponse>(`/cases/${encodeURIComponent(id)}/audit-trail`),
   escalate: (id: string, reason: string) => request<DataRecord>(`/cases/${encodeURIComponent(id)}/escalate`, { method: 'POST', body: JSON.stringify({ reason }) }),
   sar: (id: string) => request<Blob>(`/cases/${encodeURIComponent(id)}/sar-report`, { method: 'POST' }, 'blob'),

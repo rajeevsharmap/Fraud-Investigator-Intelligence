@@ -4,7 +4,9 @@ import {
   ArrowLeft,
   ArrowRight,
   Check,
+  CheckCircle2,
   ChevronRight,
+  CircleDashed,
   Download,
   Eye,
   EyeOff,
@@ -50,6 +52,33 @@ import {
   prettyKey,
   value,
 } from "./components";
+
+// Local index of case ids this browser session has opened. The backend's
+// bulk /cases response is pre-filtered per role (JUNIOR only ever sees
+// status == JUNIOR), so a case a Junior worked that later becomes SAR_READY
+// disappears from their list view. Remembering the ids client-side lets the
+// Audit-Ready queue re-fetch those cases individually - the backend still
+// authorizes every single-case fetch (JUNIOR is allowed JUNIOR or SAR_READY).
+const KNOWN_CASES_KEY = "sentinel-known-cases";
+
+function readKnownCases(): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(KNOWN_CASES_KEY) || "[]");
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === "string" && !!id)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberKnownCase(caseId: string) {
+  if (!caseId) return;
+  const known = readKnownCases();
+  if (!known.includes(caseId)) {
+    localStorage.setItem(KNOWN_CASES_KEY, JSON.stringify([...known, caseId]));
+  }
+}
 
 function userFacingError(error: unknown, fallback: string) {
   if (!(error instanceof ApiError)) return fallback;
@@ -203,7 +232,7 @@ function Shell({ children }: { children: React.ReactNode }) {
   const [menu, setMenu] = useState(false);
   const navigation = [
     { to: "/alerts", label: "Suspected Alerts", icon: AlertTriangle },
-    ...(role === "JUNIOR" ? [{ to: "/escalated", label: "Escalated Cases", icon: Users }] : []),
+    ...(role === "SENIOR" ? [{ to: "/escalated", label: "Escalated Cases", icon: Users }] : []),
     { to: "/audit", label: "Audit-Ready Cases", icon: Shield },
     { to: "/saved", label: "Reference Cases", icon: FileText },
   ];
@@ -317,7 +346,86 @@ function CaseQueue({
   const [query, setQuery] = useState("");
   const [riskFilter, setRiskFilter] = useState("all");
   const [triggerFilter, setTriggerFilter] = useState("all");
-  const filtered = data
+  // Cases this investigator opened that later left the bulk /cases response
+  // (e.g. became SAR_READY). Re-fetched individually; the backend still 403s
+  // anything this role is not allowed to open.
+  const [reopenedCases, setReopenedCases] = useState<DataRecord[]>([]);
+  // Local receipts for cases this Junior escalated (no case re-fetch: the
+  // backend 403s a Junior on SENIOR-status cases, by design).
+  const [escalationReceipts, setEscalationReceipts] = useState<DataRecord[]>([]);
+  const juniorEscalatedView = mode === "escalated" && role === "JUNIOR";
+
+  useEffect(() => {
+    if (mode !== "audit" || role !== "JUNIOR") return;
+    let cancelled = false;
+    const loadReopened = () => {
+      const ids = readKnownCases();
+      if (!ids.length) {
+        setReopenedCases([]);
+        return;
+      }
+      Promise.all(
+        ids.map((id) =>
+          api
+            .getCase(id)
+            .then((result) => result.case)
+            .catch(() => null),
+        ),
+      ).then((results) => {
+        if (cancelled) return;
+        setReopenedCases(
+          results.filter(
+            (item): item is DataRecord =>
+              !!item &&
+              value(item, ["status"], "").toUpperCase() === "SAR_READY",
+          ),
+        );
+      });
+    };
+    loadReopened();
+    window.addEventListener("sentinel:cases-changed", loadReopened);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("sentinel:cases-changed", loadReopened);
+    };
+  }, [mode, role]);
+
+  useEffect(() => {
+    if (!juniorEscalatedView) return;
+    const loadReceipts = () => {
+      setEscalationReceipts(
+        Object.keys(sessionStorage)
+          .filter((key) => key.startsWith("sentinel-escalation-"))
+          .map((key) => {
+            try {
+              return {
+                case_id: key.slice("sentinel-escalation-".length),
+                ...JSON.parse(sessionStorage.getItem(key) || "{}"),
+              } as DataRecord;
+            } catch {
+              return null;
+            }
+          })
+          .filter((item): item is DataRecord => !!item),
+      );
+    };
+    loadReceipts();
+    window.addEventListener("sentinel:cases-changed", loadReceipts);
+    return () =>
+      window.removeEventListener("sentinel:cases-changed", loadReceipts);
+  }, [juniorEscalatedView]);
+
+  const seenIds = new Set(data.map((item) => value(item, ["case_id"])));
+  const cases =
+    mode === "audit" && role === "JUNIOR"
+      ? [
+          ...data,
+          ...reopenedCases.filter(
+            (item) => !seenIds.has(value(item, ["case_id"])),
+          ),
+        ]
+      : data;
+  const filtered = cases
     .filter((item) => {
       const status = value(item, ["status"], "").toUpperCase();
       const locallyEscalated =
@@ -351,7 +459,9 @@ function CaseQueue({
     mode === "alerts"
       ? "Cases currently visible in your investigator queue."
       : mode === "escalated"
-        ? "Cases legitimately identified as moved to senior review."
+        ? juniorEscalatedView
+          ? "Local record of cases you escalated from this browser. Senior-queue case data stays restricted to the Senior role."
+          : "Cases legitimately identified as moved to senior review."
         : "Finalized cases available for audit follow-through.";
   return (
     <section>
@@ -363,7 +473,12 @@ function CaseQueue({
         </div>
         <div className="heading-meta">
           <span className="count-label">
-            {loading ? "—" : filtered.length} records
+            {loading
+              ? "—"
+              : juniorEscalatedView
+                ? escalationReceipts.length
+                : filtered.length}{" "}
+            records
           </span>
           <button className="button secondary" onClick={reload}>
             <icons.clock size={15} />
@@ -371,7 +486,35 @@ function CaseQueue({
           </button>
         </div>
       </div>
-      <div className="toolbar">
+      {juniorEscalatedView ? (
+        loading ? (
+          <LoadingState label="Loading escalation receipts" />
+        ) : error ? (
+          <ErrorState message={error} retry={reload} />
+        ) : escalationReceipts.length === 0 ? (
+          <EmptyState
+            title="No locally escalated cases"
+            detail="Cases you escalate from this browser are recorded here locally. The backend does not expose senior-queue cases to the Junior role."
+          />
+        ) : (
+          <div className="reference-grid">
+            {escalationReceipts.map((receipt, index) => (
+              <div
+                className="reference-card"
+                key={value(receipt, ["case_id"], String(index))}
+              >
+                <div className="card-kicker">
+                  {value(receipt, ["escalation_id"], "ESCALATED")}
+                </div>
+                <h3>{value(receipt, ["case_id"])}</h3>
+                <RecordGrid record={receipt} />
+              </div>
+            ))}
+          </div>
+        )
+      ) : (
+        <>
+          <div className="toolbar">
         <div className="search-field">
           <Search size={17} />
           <input
@@ -449,6 +592,8 @@ function CaseQueue({
           ))}
         </div>
       )}
+        </>
+      )}
     </section>
   );
 }
@@ -522,7 +667,10 @@ function CaseWorkspace() {
     setAccessDenied(false);
     api
       .getCase(caseId)
-      .then(setDetail)
+      .then((result) => {
+        setDetail(result);
+        rememberKnownCase(caseId);
+      })
       .catch((error) => {
         setAccessDenied(error instanceof ApiError && error.status === 403);
         setError(userFacingError(error, "Unable to load case"));
@@ -668,6 +816,14 @@ function Overview({
       setReason("");
       setEscalated(true);
       sessionStorage.setItem(`sentinel-escalated-${caseId}`, "true");
+      sessionStorage.setItem(
+        `sentinel-escalation-${caseId}`,
+        JSON.stringify({
+          escalation_id: value(result, ["escalation_id"], ""),
+          reason,
+          escalated_at: new Date().toISOString(),
+        }),
+      );
       window.dispatchEvent(new Event("sentinel:cases-changed"));
       onRefresh();
     } catch (error) {
@@ -737,6 +893,7 @@ function Overview({
           <div className="panel">
             <h3>Investigation response</h3>
             <Workflow agents={investigation.agents as DataRecord} />
+            <HypothesisResults agents={investigation.agents as DataRecord} />
             <JsonBlock data={investigation.llm_safe_evidence} />
           </div>
         )}
@@ -829,12 +986,175 @@ function Overview({
   );
 }
 
+// Account-swap cases can have zero internal fund-flow edges (every
+// counterparty external), so the Graph tab falls back to this builder: an
+// "external exposure" graph from the sanitized evidence package showing
+// external money movement plus the device / geo-login security surface.
+function buildSwapGraph(evidence: DataRecord): {
+  elements: unknown[];
+  summary: { peers: number; outbound: number; devices: number; locations: number };
+} {
+  const account = (evidence.account || {}) as DataRecord;
+  const accountId = String(
+    value(account, ["account_id"], String(evidence.case_id || "case-account")),
+  );
+  const elements: unknown[] = [
+    {
+      data: {
+        id: accountId,
+        label: `Case account ${accountId}`,
+        is_case_account: true,
+        depth: 0,
+      },
+    },
+  ];
+
+  const peers = new Map<
+    string,
+    { inbound: number; outbound: number; count: number; channels: Set<string>; last: string }
+  >();
+  for (const txn of (evidence.transactions || []) as DataRecord[]) {
+    const peer = value(txn, ["counterparty", "beneficiary_id", "dest_acct"], "");
+    if (!peer || peer === accountId) continue;
+    const entry =
+      peers.get(peer) ||
+      { inbound: 0, outbound: 0, count: 0, channels: new Set<string>(), last: "" };
+    const amount = Number(value(txn, ["amount"], "0")) || 0;
+    if (value(txn, ["direction"], "OUT") === "IN") entry.inbound += amount;
+    else entry.outbound += amount;
+    entry.count += 1;
+    entry.channels.add(value(txn, ["channel"], ""));
+    entry.last = value(txn, ["timestamp"], entry.last);
+    peers.set(peer, entry);
+  }
+  let outboundTotal = 0;
+  peers.forEach((entry, peer) => {
+    outboundTotal += entry.outbound;
+    elements.push({
+      data: {
+        id: peer,
+        label: peer,
+        depth: 1,
+        total_in: Math.round(entry.inbound) || undefined,
+        total_out: Math.round(entry.outbound) || undefined,
+        transactions: entry.count,
+        channels: [...entry.channels].filter(Boolean).join(", "),
+        last_activity: entry.last,
+      },
+      classes: peer.startsWith("EXT") ? "swap-external" : "",
+    });
+    if (entry.outbound > 0) {
+      elements.push({
+        data: {
+          id: `flow-out-${peer}`,
+          source: accountId,
+          target: peer,
+          amount: Math.round(entry.outbound),
+          transactions: entry.count,
+          channel: "outbound",
+          timestamp: entry.last,
+        },
+        classes: "swap-edge-money",
+      });
+    }
+    if (entry.inbound > 0) {
+      elements.push({
+        data: {
+          id: `flow-in-${peer}`,
+          source: peer,
+          target: accountId,
+          amount: Math.round(entry.inbound),
+          transactions: entry.count,
+          channel: "inbound",
+          timestamp: entry.last,
+        },
+        classes: "swap-edge-money",
+      });
+    }
+  });
+
+  for (const device of (evidence.devices || []) as DataRecord[]) {
+    const id = value(device, ["device_id"], "");
+    if (!id) continue;
+    const risky =
+      value(device, ["sim_change_detected"], "FALSE") === "TRUE" ||
+      value(device, ["jailbroken_rooted"], "FALSE") === "TRUE" ||
+      value(device, ["is_trusted_device"], "TRUE") !== "TRUE";
+    elements.push({
+      data: {
+        id,
+        label: `${value(device, ["device_type"], "Device")} - ${id}`,
+        os: value(device, ["os"], ""),
+        trusted: value(device, ["is_trusted_device"], ""),
+        sim_change: value(device, ["sim_change_detected"], ""),
+        jailbroken: value(device, ["jailbroken_rooted"], ""),
+        status: value(device, ["device_status"], ""),
+      },
+      classes: risky ? "swap-device swap-risky" : "swap-device",
+    });
+    elements.push({
+      data: { id: `uses-${id}`, source: accountId, target: id, relation: "device access" },
+      classes: "swap-edge-device",
+    });
+  }
+
+  const cities = new Map<string, { events: number; vpn: boolean; country: string; last: string }>();
+  for (const geo of (evidence.geo_events || []) as DataRecord[]) {
+    const city = value(geo, ["city"], "");
+    if (!city) continue;
+    const entry =
+      cities.get(city) || { events: 0, vpn: false, country: value(geo, ["country"], ""), last: "" };
+    entry.events += 1;
+    if (value(geo, ["is_vpn_or_proxy"], "FALSE") === "TRUE") entry.vpn = true;
+    entry.last = value(geo, ["timestamp"], entry.last);
+    cities.set(city, entry);
+  }
+  cities.forEach((entry, city) => {
+    elements.push({
+      data: {
+        id: `geo-${city}`,
+        label: city,
+        events: entry.events,
+        country: entry.country,
+        vpn: entry.vpn ? "YES" : "NO",
+        last: entry.last,
+      },
+      classes: entry.vpn ? "swap-geo swap-risky" : "swap-geo",
+    });
+    elements.push({
+      data: {
+        id: `geo-from-${city}`,
+        source: accountId,
+        target: `geo-${city}`,
+        relation: "login / auth",
+        events: entry.events,
+      },
+      classes: "swap-edge-geo",
+    });
+  });
+
+  return {
+    elements,
+    summary: {
+      peers: peers.size,
+      outbound: Math.round(outboundTotal),
+      devices: ((evidence.devices || []) as DataRecord[]).length,
+      locations: cities.size,
+    },
+  };
+}
+
+type SwapLayer = "all" | "money" | "devices" | "geo";
+
 function Graph({ caseId }: { caseId: string }) {
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
   const [network, setNetwork] = useState<DataRecord | null>(null);
   const [selected, setSelected] = useState<DataRecord | null>(null);
   const [hovered, setHovered] = useState<{ data: DataRecord; x: number; y: number } | null>(null);
   const [depthLimit, setDepthLimit] = useState<number | null>(null);
+  const [swap, setSwap] = useState<ReturnType<typeof buildSwapGraph> | null>(null);
+  const [swapLoading, setSwapLoading] = useState(false);
+  const [layer, setLayer] = useState<SwapLayer>("all");
   const graphRef = useRef<cytoscape.Core | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -845,26 +1165,45 @@ function Graph({ caseId }: { caseId: string }) {
     setSelected(null);
     setHovered(null);
     setDepthLimit(null);
+    setSwap(null);
+    setSwapLoading(false);
+    setLayer("all");
     api
       .getNetwork(caseId)
-      .then((result) => setNetwork(result as DataRecord))
+      .then((result) => {
+        setNetwork(result as DataRecord);
+        const els = (result as DataRecord).elements;
+        if (Array.isArray(els) && els.length === 0) {
+          setSwapLoading(true);
+          return api
+            .getEvidence(caseId)
+            .then((evidence) => setSwap(buildSwapGraph(evidence)))
+            .catch(() => undefined)   // not investigated yet -> normal empty state
+            .finally(() => setSwapLoading(false));
+        }
+      })
       .catch((error) => setError(userFacingError(error, "The case network could not be loaded.")))
       .finally(() => setLoading(false));
   }, [caseId]);
   useEffect(() => {
     if (!container || !network) return;
-    const elements = Array.isArray(network.elements)
-      ? network.elements.map((element) => {
-          const data = (element.data || {}) as DataRecord;
-          const depth = Number(data.depth);
-          const classes = data.is_case_account === true
-            ? "case-account"
-            : Number.isFinite(depth) && depth >= 1 && depth <= 3
-              ? `depth-${depth}`
-              : "";
-          return { ...element, classes };
-        })
-      : [];
+    const rawElements: DataRecord[] = swap
+      ? (swap.elements as unknown as DataRecord[])
+      : Array.isArray(network.elements)
+        ? (network.elements as DataRecord[])
+        : [];
+    const elements = rawElements.map((element) => {
+      const data = (element.data || {}) as DataRecord;
+      const depth = Number(data.depth);
+      const base = data.is_case_account === true
+        ? "case-account"
+        : Number.isFinite(depth) && depth >= 1 && depth <= 3
+          ? `depth-${depth}`
+          : "";
+      const extra = typeof element.classes === "string" ? element.classes : "";
+      const classes = [base, extra].filter(Boolean).join(" ");
+      return { ...element, classes };
+    });
     if (!elements.length) return;
     const graph = cytoscape({
       container,
@@ -904,20 +1243,51 @@ function Graph({ caseId }: { caseId: string }) {
         { selector: ".context-muted", style: { opacity: 0.16 } },
         { selector: ".context-active", style: { opacity: 1, "line-color": "#78d6df", "target-arrow-color": "#78d6df", width: 3 } },
         { selector: ":selected", style: { "border-color": "#f0d18a", "border-width": 3, "line-color": "#f0d18a", "target-arrow-color": "#f0d18a" } },
+        { selector: ".swap-external", style: { "background-color": "#7d4634", "border-color": "#d9a75b", "border-width": 2, "border-style": "dashed", width: 30, height: 30 } },
+        { selector: ".swap-device", style: { "background-color": "#35566b", "border-color": "#6dabb8", shape: "round-rectangle", width: 26, height: 26 } },
+        { selector: ".swap-geo", style: { "background-color": "#3d6b52", "border-color": "#7fc39a", shape: "round-rectangle", width: 26, height: 26 } },
+        { selector: ".swap-risky", style: { "background-color": "#8f3540", "border-color": "#e08a8a", "border-width": 3 } },
+        { selector: ".layer-hidden", style: { display: "none" } },
       ],
-      layout: {
-        name: "cose",
-        animate: true,
-        animationDuration: 850,
-        animationEasing: "ease-out-cubic",
-        refresh: 30,
-        fit: true,
-        padding: 45,
-        nodeRepulsion: 450000,
-        idealEdgeLength: 105,
-        gravity: 0.35,
-      },
     });
+    // The layout is created explicitly (makeLayout + run, identical to the
+    // constructor's `layout` option behaviour) so the cleanup holds a handle:
+    // a running layout keeps its own animation frame, and letting it tick
+    // against a destroyed core throws the "notify" / "isHeadless" errors on
+    // every interaction after unmount.
+    // Swap mode is a hub-and-spoke (one account, dozens of peers) - cose
+    // scatters it, concentric rings read better and settle deterministically.
+    const runningLayout = graph.makeLayout(
+      swap
+        ? {
+            name: "concentric",
+            concentric: (node: cytoscape.NodeSingular) =>
+              node.data("is_case_account") === true
+                ? 2
+                : node.hasClass("swap-device") || node.hasClass("swap-geo")
+                  ? 0
+                  : 1,
+            levelWidth: () => 1,
+            minNodeSpacing: 26,
+            animate: true,
+            animationDuration: 700,
+            fit: true,
+            padding: 45,
+          }
+        : {
+            name: "cose",
+            animate: true,
+            animationDuration: 850,
+            animationEasing: "ease-out-cubic",
+            refresh: 30,
+            fit: true,
+            padding: 45,
+            nodeRepulsion: 450000,
+            idealEdgeLength: 105,
+            gravity: 0.35,
+          },
+    );
+    runningLayout.run();
     graphRef.current = graph;
     let physicsFrame = 0;
     let draggedNode: cytoscape.NodeSingular | null = null;
@@ -1052,9 +1422,37 @@ function Graph({ caseId }: { caseId: string }) {
       draggedNode = null;
       pointerPosition = null;
       graphRef.current = null;
+      try {
+        runningLayout.stop();
+      } catch {
+        /* layout already ended */
+      }
       graph.destroy();
     };
-  }, [container, network]);
+  }, [container, network, swap]);
+  useEffect(() => {
+    const graph = graphRef.current;
+    if (!graph || !swap) return;
+    const nodeVisible = (node: cytoscape.NodeSingular) => {
+      if (layer === "all") return true;
+      if (layer === "money")
+        return !node.hasClass("swap-device") && !node.hasClass("swap-geo");
+      if (layer === "devices")
+        return node.hasClass("swap-device") || node.data("is_case_account") === true;
+      return node.hasClass("swap-geo") || node.data("is_case_account") === true;
+    };
+    graph.nodes().forEach((node) => {
+      node.toggleClass("layer-hidden", !nodeVisible(node));
+    });
+    graph.edges().forEach((edge) => {
+      const edgeLayer = edge.hasClass("swap-edge-device")
+        ? "devices"
+        : edge.hasClass("swap-edge-geo")
+          ? "geo"
+          : "money";
+      edge.toggleClass("layer-hidden", !(layer === "all" || layer === edgeLayer));
+    });
+  }, [layer, swap]);
   useEffect(() => {
     const graph = graphRef.current;
     if (!graph) return;
@@ -1069,9 +1467,19 @@ function Graph({ caseId }: { caseId: string }) {
     graph.elements().removeClass("context-muted context-active");
     graph.fit(undefined, 35);
   }, [depthLimit]);
-  if (loading) return <LoadingState label="Building case network" />;
+  if (loading || (swapLoading && !swap))
+    return (
+      <LoadingState
+        label={swapLoading ? "Building external exposure map" : "Building case network"}
+      />
+    );
   if (error) return <ErrorState message="Unable to load network data. Please try again." />;
-  const elements = Array.isArray(network?.elements) ? network.elements : [];
+  const swapMode = !!swap;
+  const elements = swap
+    ? (swap.elements as DataRecord[])
+    : Array.isArray(network?.elements)
+      ? (network.elements as DataRecord[])
+      : [];
   const nodes = elements.filter((element) => element.group === "nodes");
   const edges = elements.filter((element) => element.group === "edges");
   const depths = nodes.map((element) => Number((element.data as DataRecord | undefined)?.depth)).filter((depth) => Number.isFinite(depth) && depth >= 1 && depth <= 3);
@@ -1080,12 +1488,20 @@ function Graph({ caseId }: { caseId: string }) {
   return (
     <div className="graph-view">
       <div className="graph-toolbar">
-        <div><span className="eyebrow">Network intelligence</span><h2>Fund-flow network</h2><p>{caseAccount ? `Case account ${caseAccount}` : "Backend network for this case"}</p></div>
+        <div><span className="eyebrow">Network intelligence</span><h2>{swapMode ? "External exposure & security map" : "Fund-flow network"}</h2><p>{swapMode ? "No internal fund-flow trail exists for this case (account-swap pattern): external counterparties, devices and login locations from the sanitized evidence." : caseAccount ? `Case account ${caseAccount}` : "Backend network for this case"}</p></div>
         <div className="graph-actions">
           <button className="button secondary" onClick={() => graphRef.current?.zoom((graphRef.current?.zoom() || 1) + .2)}>Zoom in</button>
           <button className="button secondary" onClick={() => graphRef.current?.zoom(Math.max(.2, (graphRef.current?.zoom() || 1) - .2))}>Zoom out</button>
           <button className="button secondary" onClick={() => graphRef.current?.fit(undefined, 35)}>Fit network</button>
-          {caseAccount && <button className="button secondary" onClick={() => { const node = graphRef.current?.getElementById(caseAccount); if (node?.length) graphRef.current?.animate({ center: { eles: node }, zoom: 1.25 }, { duration: 220 }); }}>Focus case account</button>}
+          {caseAccount && !swapMode && <button className="button secondary" onClick={() => { const node = graphRef.current?.getElementById(caseAccount); if (node?.length) graphRef.current?.animate({ center: { eles: node }, zoom: 1.25 }, { duration: 220 }); }}>Focus case account</button>}
+          {swapMode && (
+            <div className="depth-controls">
+              <span>Layers</span>
+              {([["all", "All"], ["money", "Money flow"], ["devices", "Devices"], ["geo", "Geo logins"]] as [SwapLayer, string][]).map(([key, label]) => (
+                <button key={key} className={layer === key ? "active" : ""} onClick={() => setLayer(key)}>{label}</button>
+              ))}
+            </div>
+          )}
         </div>
       </div>
       {!elements.length ? (
@@ -1097,13 +1513,28 @@ function Graph({ caseId }: { caseId: string }) {
       ) : <div className="graph-layout">
         <div className="graph-panel panel">
           <div className="graph-canvas" ref={setContainer}>
-            {hovered && <div className="graph-tooltip" style={{ left: hovered.x, top: hovered.y }}><strong>{hovered.data.source ? "Transaction" : "Account"}</strong><span>{value(hovered.data, ["label", "id", "transaction_id"])}</span>{hovered.data.depth !== undefined && <span>Depth {formatValue(hovered.data.depth)}</span>}</div>}
+            {hovered && <div className="graph-tooltip" style={{ left: hovered.x, top: hovered.y }}><strong>{hovered.data.source ? "Transaction" : hovered.data.os ? "Device" : hovered.data.events !== undefined && String(hovered.data.id || "").startsWith("geo-") ? "Login location" : "Account"}</strong><span>{value(hovered.data, ["label", "id", "transaction_id"])}</span>{hovered.data.depth !== undefined && <span>Depth {formatValue(hovered.data.depth)}</span>}</div>}
           </div>
-          <div className="graph-legend"><span><i className="legend-dot case" />Case account</span><span><i className="legend-dot d1" />Depth 1</span><span><i className="legend-dot d2" />Depth 2</span><span><i className="legend-dot d3" />Depth 3</span><span><i className="legend-line" />Transaction / fund transfer</span></div>
+          {swapMode ? (
+            <div className="graph-legend"><span><i className="legend-dot case" />Case account</span><span><i className="legend-dot d3" />External counterparty</span><span><i className="legend-dot d1" />Device</span><span><i className="legend-dot d2" />Login location</span><span><i className="legend-dot" style={{ background: "#8f3540" }} />Flagged (VPN / risky device)</span></div>
+          ) : (
+            <div className="graph-legend"><span><i className="legend-dot case" />Case account</span><span><i className="legend-dot d1" />Depth 1</span><span><i className="legend-dot d2" />Depth 2</span><span><i className="legend-dot d3" />Depth 3</span><span><i className="legend-line" />Transaction / fund transfer</span></div>
+          )}
         </div>
-        <aside className="graph-context panel"><div className="eyebrow">Network context</div><h3>{selected ? (selected.source ? "Transaction detail" : "Selected account") : "Select an element"}</h3>{selected ? <RecordGrid record={selected} /> : <p className="muted">Click a node or transaction edge to inspect backend-provided details.</p>}</aside>
+        <aside className="graph-context panel"><div className="eyebrow">Network context</div><h3>{selected ? (selected.source ? (selected.relation ? "Security relation" : "Transaction detail") : selected.os ? "Device detail" : String(selected.id || "").startsWith("geo-") ? "Login location" : "Selected account") : "Select an element"}</h3>{selected ? <RecordGrid record={selected} /> : <p className="muted">Click a node or edge to inspect backend-provided details.</p>}</aside>
       </div>}
-      <div className="graph-summary"><Metric label="Nodes" value={value(stats, ["nodes"], String(nodes.length))} icon={Users} /><Metric label="Transactions" value={value(stats, ["edges"], String(edges.length))} icon={GitBranch} /><Metric label="Maximum depth" value={value(stats, ["max_reached_depth"], depths.length ? String(Math.max(...depths)) : "—")} icon={GitBranch} />{depths.length > 0 && <div className="depth-controls"><span>Depth view</span><button className={depthLimit === null ? "active" : ""} onClick={() => setDepthLimit(null)}>All</button>{[1, 2, 3].filter((depth) => depths.includes(depth)).map((depth) => <button className={depthLimit === depth ? "active" : ""} key={depth} onClick={() => setDepthLimit(depth)}>Depth {depth}</button>)}</div>}</div>
+      <div className="graph-summary">{swapMode ? (
+        <>
+          <Metric label="External counterparties" value={String(swap!.summary.peers)} icon={Users} />
+          <Metric label="Outbound volume" value={String(swap!.summary.outbound)} icon={ArrowRight} />
+          <Metric label="Devices" value={String(swap!.summary.devices)} icon={Shield} />
+          <Metric label="Login locations" value={String(swap!.summary.locations)} icon={GitBranch} />
+        </>
+      ) : (
+        <>
+          <Metric label="Nodes" value={value(stats, ["nodes"], String(nodes.length))} icon={Users} /><Metric label="Transactions" value={value(stats, ["edges"], String(edges.length))} icon={GitBranch} /><Metric label="Maximum depth" value={value(stats, ["max_reached_depth"], depths.length ? String(Math.max(...depths)) : "—")} icon={GitBranch} />{depths.length > 0 && <div className="depth-controls"><span>Depth view</span><button className={depthLimit === null ? "active" : ""} onClick={() => setDepthLimit(null)}>All</button>{[1, 2, 3].filter((depth) => depths.includes(depth)).map((depth) => <button className={depthLimit === depth ? "active" : ""} key={depth} onClick={() => setDepthLimit(depth)}>Depth {depth}</button>)}</div>}
+        </>
+      )}</div>
     </div>
   );
 }
@@ -1204,22 +1635,162 @@ function EvidenceSections({ data }: { data: DataRecord }) {
   );
 }
 
-function SarAudits({ caseId }: { caseId: string }) {
+// Step tracker for the backend investigation contract:
+// POST /investigate (evidence + agents) -> POST /analysis -> POST /sar-report.
+function PipelineSteps({ steps }: { steps: { label: string; done: boolean }[] }) {
+  return (
+    <div className="workflow">
+      {steps.map((step, index) => (
+        <div className="workflow-step" key={step.label}>
+          <div className={`workflow-icon ${step.done ? "done" : ""}`}>
+            {step.done ? <CheckCircle2 size={16} /> : <CircleDashed size={16} />}
+          </div>
+          <div>
+            <strong>{step.label}</strong>
+            <span>{step.done ? "Complete" : "Pending"}</span>
+          </div>
+          {index < steps.length - 1 && (
+            <ArrowRight className="workflow-arrow" size={14} />
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// The three Grok hypothesis agents (Checkpoint 4), rendered from stored
+// backend responses only.
+function HypothesisResults({ agents }: { agents: DataRecord | null }) {
+  if (!agents) return null;
+  const sections: [string, unknown][] = [
+    ["Fraud / scam hypothesis", agents.scammer_hypothesis],
+    ["Legitimate hypothesis", agents.legitimate_hypothesis],
+    ["Contradiction", agents.contradiction],
+  ];
+  return (
+    <>
+      {sections.map(([title, result]) => (
+        <div className="evidence-section" key={title}>
+          <h3>{title}</h3>
+          {result && typeof result === "object" ? (
+            <RecordGrid record={result as DataRecord} />
+          ) : (
+            <p className="muted">{formatValue(result)}</p>
+          )}
+        </div>
+      ))}
+    </>
+  );
+}
+
+function SarAudits({
+  caseId,
+  detail,
+}: {
+  caseId: string;
+  detail: { case: DataRecord; alerts: DataRecord[] };
+}) {
   const [audit, setAudit] = useState<DataRecord[]>([]);
   const [auditError, setAuditError] = useState("");
+  // Pipeline gates per the backend contract: POST /sar-report only accepts a
+  // case that already has BOTH an evidence package and a stored analysis
+  // (POST /investigate -> POST /analysis -> POST /sar-report).
+  const [evidenceState, setEvidenceState] = useState<
+    "loading" | "ready" | "missing"
+  >("loading");
+  const [analysisState, setAnalysisState] = useState<
+    "loading" | "ready" | "notrun"
+  >("loading");
+  const [analysis, setAnalysis] = useState<DataRecord | null>(null);
+  const [agents, setAgents] = useState<DataRecord | null>(null);
+  const [investigating, setInvestigating] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
   const [sarLoading, setSarLoading] = useState(false);
+  const [sarDone, setSarDone] = useState(false);
   const [sarError, setSarError] = useState("");
+  const [progress, setProgress] = useState("");
   const [saved, setSaved] = useState(false);
   const [reveal, setReveal] = useState<DataRecord | null>(null);
   const { role } = useRole();
-  useEffect(() => {
+  const loadAudit = () => {
     api
       .getAudit(caseId)
       .then((result) => setAudit(result.events))
       .catch((error) =>
         setAuditError(userFacingError(error, "The audit trail could not be loaded.")),
       );
+  };
+  useEffect(() => {
+    loadAudit();
   }, [caseId]);
+  useEffect(() => {
+    setEvidenceState("loading");
+    api
+      .getEvidence(caseId)
+      .then(() => setEvidenceState("ready"))
+      .catch(() => setEvidenceState("missing"));
+  }, [caseId]);
+  useEffect(() => {
+    setAnalysisState("loading");
+    setAnalysis(null);
+    setAgents(null);
+    setSarDone(false);
+    setProgress("");
+    setSarError("");
+    api
+      .getAnalysis(caseId)
+      .then((result) => {
+        setAnalysis(result);
+        setAgents((result.agents || null) as DataRecord | null);
+        setAnalysisState("ready");
+      })
+      .catch((error) => {
+        if (error instanceof ApiError && error.status !== 404)
+          console.error("[SENTINEL] stored analysis could not be loaded", error);
+        setAnalysisState("notrun");
+      });
+  }, [caseId]);
+  const startInvestigation = async () => {
+    setInvestigating(true);
+    setSarError("");
+    setProgress("");
+    try {
+      const result = await api.investigate(caseId);
+      setAgents((result.agents || null) as DataRecord | null);
+      setEvidenceState("ready");
+      setProgress(
+        "Evidence bundle sanitized and sent to the three hypothesis agents (scammer, legitimate, contradiction). Run the analysis to score the investigation.",
+      );
+      loadAudit();
+    } catch (error) {
+      setSarError(
+        userFacingError(error, "The investigation could not be completed."),
+      );
+      console.error("[SENTINEL] investigation failed", error);
+    } finally {
+      setInvestigating(false);
+    }
+  };
+  const runAnalysis = async () => {
+    setAnalyzing(true);
+    setSarError("");
+    setProgress("");
+    try {
+      const result = await api.runAnalysis(caseId);
+      setAnalysis(result);
+      setAgents((result.agents || null) as DataRecord | null);
+      setAnalysisState("ready");
+      setProgress(
+        "Analysis stored: regulatory findings, completeness score, routing and next-best-action are ready. The SAR PDF can now be generated.",
+      );
+      loadAudit();
+    } catch (error) {
+      setSarError(userFacingError(error, "Analysis could not be completed."));
+      console.error("[SENTINEL] analysis failed", error);
+    } finally {
+      setAnalyzing(false);
+    }
+  };
   const generateSar = async () => {
     setSarLoading(true);
     setSarError("");
@@ -1231,6 +1802,11 @@ function SarAudits({ caseId }: { caseId: string }) {
       link.download = `SAR_${caseId}.pdf`;
       link.click();
       URL.revokeObjectURL(url);
+      setSarDone(true);
+      setProgress(
+        `SAR PDF downloaded. It opens with the last four characters of account ${value(detail.case, ["account_id"])}.`,
+      );
+      loadAudit();
     } catch (error) {
       setSarError(userFacingError(error, "The SAR report could not be generated."));
       console.error("[SENTINEL] SAR generation failed", error);
@@ -1246,9 +1822,107 @@ function SarAudits({ caseId }: { caseId: string }) {
       setSarError(userFacingError(error, "The case could not be saved to references."));
     }
   };
+  const sarReady = evidenceState === "ready" && !!analysis;
+  const pipelineSteps = [
+    { label: "Evidence bundle", done: evidenceState === "ready" },
+    { label: "Hypothesis agents", done: !!agents },
+    { label: "Regulatory + auditor", done: !!analysis },
+    { label: "SAR report", done: sarDone },
+  ];
   return (
     <div className="workspace-grid">
       <div className="workspace-main">
+        <div className="panel">
+          <div className="section-title compact">
+            <div>
+              <h2>Investigation pipeline</h2>
+              <p>
+                Evidence bundle → three hypothesis agents → regulatory
+                analysis → SAR report.
+              </p>
+            </div>
+            {analysisState !== "loading" && !agents && (
+              <button
+                className="button primary"
+                disabled={investigating}
+                onClick={startInvestigation}
+              >
+                {investigating ? (
+                  "Investigation running"
+                ) : (
+                  <>
+                    <Play size={15} />
+                    Start investigation
+                  </>
+                )}
+              </button>
+            )}
+            {agents && !analysis && (
+              <button
+                className="button primary"
+                disabled={analyzing}
+                onClick={runAnalysis}
+              >
+                {analyzing ? (
+                  "Analysis running"
+                ) : (
+                  <>
+                    <Play size={15} />
+                    Run analysis
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+          <PipelineSteps steps={pipelineSteps} />
+          <Workflow agents={agents} />
+          {progress && (
+            <div className="inline-success">
+              <Check size={16} />
+              <span>{progress}</span>
+            </div>
+          )}
+          {sarError && (
+            <div className="inline-error">
+              <X size={16} />
+              {sarError}
+            </div>
+          )}
+          {analysisState === "loading" ? (
+            <LoadingState label="Checking for stored analysis" />
+          ) : agents ? (
+            <HypothesisResults agents={agents} />
+          ) : (
+            <EmptyState
+              title="Investigation not started"
+              detail="Start the investigation to bundle sanitized evidence and run the three hypothesis agents on the backend."
+            />
+          )}
+          {analysis && <JsonBlock data={analysis} />}
+        </div>
+        {analysis && (
+          <div className="panel">
+            <div className="section-title compact">
+              <div>
+                <h2>Investigation assessment</h2>
+                <p>
+                  Auditor, routing and next-best-action from the stored
+                  analysis.
+                </p>
+              </div>
+            </div>
+            <div className="evidence-section">
+              <h3>Completeness &amp; routing</h3>
+              <RecordGrid record={(analysis.auditor || {}) as DataRecord} />
+            </div>
+            <div className="evidence-section">
+              <h3>Next best action</h3>
+              <RecordGrid
+                record={(analysis.next_best_action || {}) as DataRecord}
+              />
+            </div>
+          </div>
+        )}
         <div className="panel">
           <div className="section-title compact">
             <div>
@@ -1326,9 +2000,16 @@ function SarAudits({ caseId }: { caseId: string }) {
             Generate the protected PDF through the backend. The frontend never
             receives aliases or report secrets.
           </p>
+          {!sarReady && (
+            <p className="field-note">
+              {evidenceState !== "ready"
+                ? "The backend requires the evidence bundle first. Start the investigation above (or on the Overview tab), then run the analysis."
+                : "Stored analysis is required first. Run the analysis above, then generate the SAR."}
+            </p>
+          )}
           <button
             className="button primary"
-            disabled={sarLoading}
+            disabled={sarLoading || !sarReady}
             onClick={generateSar}
           >
             {sarLoading ? (
